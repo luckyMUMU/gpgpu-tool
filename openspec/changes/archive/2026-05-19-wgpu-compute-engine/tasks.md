@@ -113,7 +113,7 @@
 ## 6. 文档与发布准备
 
 - [x] 6.1 为公共 API 编写 rustdoc 文档（`GpuContext`、`GpuBuffer`、`ComputePipeline`、`Sha256Computer`）
-- [ ] 6.2 在 `README.md` 中添加项目简介、架构说明、使用示例、性能数据
+- [x] 6.2 在 `README.md` 中添加项目简介、架构说明、使用示例、性能数据
 - [x] 6.3 编写 `examples/demo.rs` 演示批量 SHA-256 计算
 - [x] 6.4 编写基准测试 `benches/sha256_bench.rs`
 - [x] 6.5 运行 `cargo clippy` 与 `cargo fmt`，确保代码风格一致

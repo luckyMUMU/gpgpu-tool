@@ -87,20 +87,22 @@ impl GpuBuffer {
         encoder.copy_buffer_to_buffer(&self.buffer, 0, &staging, 0, self.size);
         queue.submit(std::iter::once(encoder.finish()));
 
-        staging.slice(..).map_async(wgpu::MapMode::Read, |result| {
-            if let Err(e) = result {
-                log::error!("缓冲区映射失败: {}", e);
-            }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        staging.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).ok();
         });
 
         device.poll(wgpu::Maintain::Wait);
 
-        {
-            let view = staging.slice(..).get_mapped_range();
-            let result = view.to_vec();
-            drop(view);
-            staging.unmap();
-            Ok(result)
+        match receiver.recv().unwrap() {
+            Ok(()) => {
+                let view = staging.slice(..).get_mapped_range();
+                let result = view.to_vec();
+                drop(view);
+                staging.unmap();
+                Ok(result)
+            }
+            Err(e) => Err(GpuError::MapFailed(e.to_string())),
         }
     }
 

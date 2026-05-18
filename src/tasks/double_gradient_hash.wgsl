@@ -18,11 +18,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let pixels_per_image = width * height;
     let base = img_idx * pixels_per_image;
 
-    // 双梯度：同时计算水平和垂直梯度，各取 32bit 组合为 64bit
-    var hash_low: u32 = 0u;  // 水平梯度 32bit
-    var hash_high: u32 = 0u; // 垂直梯度 32bit
+    // 双梯度：水平梯度占低 32bit，垂直梯度占高 32bit
+    var hash_low: u32 = 0u;
+    var hash_high: u32 = 0u;
 
-    // 水平梯度（每行前 width-1 个比较）
+    // 水平梯度（每行相邻像素比较）
+    var h_bit_pos: u32 = 0u;
     for (var row = 0u; row < height; row = row + 1u) {
         for (var col = 0u; col < width - 1u; col = col + 1u) {
             let idx = row * width + col;
@@ -30,14 +31,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let right = pixels[base + idx + 1u];
             let bit = select(0u, 1u, right > left);
 
-            let bit_idx = row * (width - 1u) + col;
-            if (bit_idx < 32u) {
-                hash_low = hash_low | (bit << bit_idx);
+            if (h_bit_pos < 32u) {
+                hash_low = hash_low | (bit << h_bit_pos);
+                h_bit_pos = h_bit_pos + 1u;
             }
         }
     }
 
-    // 垂直梯度（每列前 height-1 个比较）
+    // 垂直梯度（每列相邻像素比较）
+    var v_bit_pos: u32 = 0u;
     for (var col = 0u; col < width; col = col + 1u) {
         for (var row = 0u; row < height - 1u; row = row + 1u) {
             let idx = row * width + col;
@@ -45,9 +47,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let below = pixels[base + idx + width];
             let bit = select(0u, 1u, below > current);
 
-            let bit_idx = col * (height - 1u) + row;
-            if (bit_idx < 32u) {
-                hash_high = hash_high | (bit << bit_idx);
+            if (v_bit_pos < 32u) {
+                hash_high = hash_high | (bit << v_bit_pos);
+                v_bit_pos = v_bit_pos + 1u;
             }
         }
     }

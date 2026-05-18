@@ -94,10 +94,21 @@
 - [x] 5.2.2 使用 BufferPool 复用多 block 路径的 input/output 缓冲区
 - [x] 5.2.3 保持正确性：多 block 消息仍按顺序逐 block 计算（SHA-256 数据依赖）
 
-### 5.3 优化效果验证
-- [x] 5.3.1 重新运行 `cargo bench` 获取优化后数据
-- [x] 5.3.2 对比优化前后：单 block 批量、多 block 批量、workgroup_size、GPU 开销拆解
-- [x] 5.3.3 生成优化报告，记录瓶颈根因与后续优化方向
+### 5.3 异步批量提交 API（能力层，算法无关）
+- [x] 5.3.1 设计通用 `GpuBatchSubmitter` 结构体，不绑定具体算法
+- [x] 5.3.2 实现 `BatchJob` 描述任意计算任务（input/output/params/pipeline/dispatch）
+- [x] 5.3.3 实现 `GpuBatchSubmitter::submit()` 非阻塞提交（仅编码命令，不创建 staging）
+- [x] 5.3.4 实现 `GpuBatchSubmitter::wait_all()` 统一等待并读取所有结果
+- [x] 5.3.5 在 `Sha256Computer` 中实现 `batch_submitter()` 便捷接口
+- [x] 5.3.6 实现 `Sha256BatchSubmitter::submit()` 支持单 block 消息批量异步提交
+- [x] 5.3.7 实现 `Sha256BatchSubmitter::wait_all()` 返回 (原始索引, 哈希值) 列表
+
+### 5.4 优化效果验证
+- [x] 5.4.1 重新运行 `cargo bench` 获取优化后数据
+- [x] 5.4.2 对比优化前后：单 block 批量、多 block 批量、workgroup_size、GPU 开销拆解
+- [x] 5.4.3 添加异步批量基准测试：sync_10x_single vs async_10x_single
+- [x] 5.4.4 验证异步批量提交加速比：10 次单条 4.3x，100 次单条 6.3x，10 次批量 4.4x
+- [x] 5.4.5 生成优化报告，记录瓶颈根因与后续优化方向
 
 ## 6. 文档与发布准备
 

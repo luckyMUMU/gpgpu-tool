@@ -165,6 +165,77 @@ fn bench_gpu_overhead_breakdown(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_async_batch_submit(c: &mut Criterion) {
+    let mut ctx = GpuContext::new_sync().expect("GPU 初始化失败");
+    let sha256 = Sha256Computer::new(&mut ctx).expect("Sha256Computer 创建失败");
+
+    let mut group = c.benchmark_group("sha256_async_batch");
+
+    // 对比：同步 compute 10 次单条消息
+    let single_msg = vec![vec![0xAAu8; 32]];
+    group.bench_function("sync_10x_single", |b| {
+        b.iter(|| {
+            for _ in 0..10 {
+                let _ = sha256.compute(black_box(&ctx), black_box(&single_msg));
+            }
+        })
+    });
+
+    // 异步批量：10 次 submit + 1 次 wait_all
+    group.bench_function("async_10x_single", |b| {
+        b.iter(|| {
+            let mut submitter = sha256.batch_submitter(&ctx);
+            for _ in 0..10 {
+                submitter.submit(black_box(&single_msg)).unwrap();
+            }
+            let _ = submitter.wait_all().unwrap();
+        })
+    });
+
+    // 对比：同步 compute 100 次单条消息
+    group.bench_function("sync_100x_single", |b| {
+        b.iter(|| {
+            for _ in 0..100 {
+                let _ = sha256.compute(black_box(&ctx), black_box(&single_msg));
+            }
+        })
+    });
+
+    // 异步批量：100 次 submit + 1 次 wait_all
+    group.bench_function("async_100x_single", |b| {
+        b.iter(|| {
+            let mut submitter = sha256.batch_submitter(&ctx);
+            for _ in 0..100 {
+                submitter.submit(black_box(&single_msg)).unwrap();
+            }
+            let _ = submitter.wait_all().unwrap();
+        })
+    });
+
+    // 对比：同步 compute 10 次 100 条批量
+    let batch_100: Vec<Vec<u8>> = (0..100).map(|i| vec![i as u8; 32]).collect();
+    group.bench_function("sync_10x_batch100", |b| {
+        b.iter(|| {
+            for _ in 0..10 {
+                let _ = sha256.compute(black_box(&ctx), black_box(&batch_100));
+            }
+        })
+    });
+
+    // 异步批量：10 次 100 条 submit + 1 次 wait_all
+    group.bench_function("async_10x_batch100", |b| {
+        b.iter(|| {
+            let mut submitter = sha256.batch_submitter(&ctx);
+            for _ in 0..10 {
+                submitter.submit(black_box(&batch_100)).unwrap();
+            }
+            let _ = submitter.wait_all().unwrap();
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_single_block_batch,
@@ -172,6 +243,7 @@ criterion_group!(
     bench_pipeline_cache,
     bench_per_message_overhead,
     bench_workgroup_size,
-    bench_gpu_overhead_breakdown
+    bench_gpu_overhead_breakdown,
+    bench_async_batch_submit
 );
 criterion_main!(benches);

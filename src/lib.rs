@@ -24,6 +24,7 @@
 //! }
 //! ```
 
+mod batch;
 mod buffer;
 mod buffer_pool;
 mod chunker;
@@ -33,6 +34,7 @@ mod pipeline;
 
 pub mod tasks;
 
+pub use batch::{BatchJob, GpuBatchSubmitter};
 pub use buffer::{BufferUsage, GpuBuffer};
 pub use buffer_pool::BufferPool;
 pub use chunker::{BatchInfo, Chunker};

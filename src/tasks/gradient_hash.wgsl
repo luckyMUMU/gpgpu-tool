@@ -18,9 +18,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let pixels_per_image = width * height;
     let base = img_idx * pixels_per_image;
 
-    // 水平梯度：每行相邻像素比较（8x9 -> 8x8 = 64bit）
+    // 水平梯度：每行相邻像素比较，使用独立 bit_pos 避免信息丢失
     var hash_low: u32 = 0u;
     var hash_high: u32 = 0u;
+    var bit_pos: u32 = 0u;
 
     for (var row = 0u; row < height; row = row + 1u) {
         for (var col = 0u; col < width - 1u; col = col + 1u) {
@@ -29,11 +30,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let right = pixels[base + idx + 1u];
             let bit = select(0u, 1u, right > left);
 
-            if (idx < 32u) {
-                hash_low = hash_low | (bit << idx);
-            } else {
-                hash_high = hash_high | (bit << (idx - 32u));
+            if (bit_pos < 32u) {
+                hash_low = hash_low | (bit << bit_pos);
+            } else if (bit_pos < 64u) {
+                hash_high = hash_high | (bit << (bit_pos - 32u));
             }
+            bit_pos = bit_pos + 1u;
         }
     }
 

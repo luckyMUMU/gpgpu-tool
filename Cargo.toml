@@ -22,3 +22,33 @@ chrono = "0.4"
 name = "sha256_bench"
 path = "benches/sha256_bench.rs"
 harness = false
+
+[[bench]]
+name = "mean_hash_bench"
+path = "benches/mean_hash_bench.rs"
+harness = false
+
+[[bench]]
+name = "gradient_hash_bench"
+path = "benches/gradient_hash_bench.rs"
+harness = false
+
+[[bench]]
+name = "block_hash_bench"
+path = "benches/block_hash_bench.rs"
+harness = false
+
+[[bench]]
+name = "vert_gradient_hash_bench"
+path = "benches/vert_gradient_hash_bench.rs"
+harness = false
+
+[[bench]]
+name = "double_gradient_hash_bench"
+path = "benches/double_gradient_hash_bench.rs"
+harness = false
+
+[[bench]]
+name = "median_hash_bench"
+path = "benches/median_hash_bench.rs"
+harness = false

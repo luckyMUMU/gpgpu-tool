@@ -41,7 +41,7 @@ fn test_block_hash_batch() {
     let hasher = BlockHashComputer::new(&mut ctx).expect("创建失败");
 
     let images: Vec<Vec<u8>> = (0..10)
-        .map(|i| test_data::random_image(256 + i))
+        .map(|_| test_data::random_image(256))
         .collect();
 
     let gpu_hashes = hasher.compute(&ctx, &images).expect("计算失败");

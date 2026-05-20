@@ -5,7 +5,7 @@
 //! ## 架构
 //!
 //! - **能力层**：封装 wgpu 底层，提供 `GpuContext`（设备/队列/管线缓存）、
-//!   `GpuBuffer`（缓冲区管理）、`ComputePipeline`（计算管线）、`Chunker`（通用分批）
+//!   `GpuBuffer`（缓冲区管理）、`ComputePipeline`（计算管线）、`GpuBatchSubmitter`（批量提交）
 //! - **业务层**：基于能力层实现具体算法，如 `tasks::sha256::Sha256Computer`
 //!
 //! ## 示例
@@ -27,7 +27,6 @@
 mod batch;
 mod buffer;
 mod buffer_pool;
-mod chunker;
 mod context;
 mod error;
 mod pipeline;
@@ -37,7 +36,6 @@ pub mod tasks;
 pub use batch::{BatchJob, GpuBatchSubmitter};
 pub use buffer::{BufferUsage, GpuBuffer};
 pub use buffer_pool::BufferPool;
-pub use chunker::{BatchInfo, Chunker};
 pub use context::GpuContext;
 pub use error::GpuError;
 pub use pipeline::ComputePipeline;

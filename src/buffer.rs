@@ -23,6 +23,7 @@ fn to_wgpu_usage(usage: BufferUsage) -> BufferUsages {
 ///
 /// 通过 RAII 模式管理 GPU 内存生命周期，支持 CPU-GPU 数据双向传输。
 /// 非泛型设计，使用 `bytemuck` 在上传/下载时进行类型转换。
+#[derive(Clone)]
 pub struct GpuBuffer {
     buffer: Buffer,
     size: u64,

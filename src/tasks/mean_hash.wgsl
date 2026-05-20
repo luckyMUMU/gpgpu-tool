@@ -18,24 +18,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let pixels_per_image = width * height;
     let base = img_idx * pixels_per_image;
 
-    // 计算所有像素的均值
-    var sum: u32 = 0u;
+    // 使用 f32 计算均值，避免整数截断导致边界像素归类不一致
+    var sum: f32 = 0.0;
     for (var i = 0u; i < pixels_per_image; i = i + 1u) {
-        sum = sum + pixels[base + i];
+        sum = sum + f32(pixels[base + i]);
     }
-    let mean = sum / pixels_per_image;
+    let mean = sum / f32(pixels_per_image);
 
-    // 生成 64bit 哈希（每个像素与均值比较）
+    // 生成 64bit 哈希（像素 >= 均值生成 1bit）
     var hash_low: u32 = 0u;
     var hash_high: u32 = 0u;
 
     for (var i = 0u; i < 32u; i = i + 1u) {
-        if (pixels[base + i] > mean) {
+        if (f32(pixels[base + i]) >= mean) {
             hash_low = hash_low | (1u << i);
         }
     }
     for (var i = 0u; i < 32u; i = i + 1u) {
-        if (pixels[base + 32u + i] > mean) {
+        if (f32(pixels[base + 32u + i]) >= mean) {
             hash_high = hash_high | (1u << i);
         }
     }

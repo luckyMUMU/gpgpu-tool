@@ -4,5 +4,6 @@ pub mod gradient_hash;
 pub mod hash_common;
 pub mod mean_hash;
 pub mod median_hash;
+pub mod phasher;
 pub mod sha256;
 pub mod vert_gradient_hash;

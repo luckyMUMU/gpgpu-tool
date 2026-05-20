@@ -1,20 +1,18 @@
 /// CPU 参考实现：6 种感知哈希算法。
 ///
-/// 与 WGSL 实现保持一致的 bit 映射策略（独立 bit_pos 计数器）。
-/// 支持可变 width/height 参数。
+/// 与 WGSL 实现保持一致的算法逻辑和比较运算符。
 
 /// Mean Hash（均值哈希）CPU 参考实现。
 ///
-/// 计算所有像素的均值，每个像素与均值比较生成 1bit。
-/// 当像素数 > 64 时，只取前 64 个像素。
+/// 使用 f32 均值（与 GPU WGSL 一致），像素 >= 均值生成 1bit。
 pub fn mean_hash(pixels: &[u8], _width: u32, _height: u32) -> u64 {
     let count = pixels.len().min(64);
-    let sum: u32 = pixels[..count].iter().map(|&p| p as u32).sum();
-    let mean = sum / count as u32;
+    let sum: f32 = pixels[..count].iter().map(|&p| p as f32).sum();
+    let mean = sum / count as f32;
 
     let mut hash: u64 = 0;
     for (i, &pixel) in pixels[..count].iter().enumerate() {
-        if pixel as u32 > mean {
+        if pixel as f32 >= mean {
             hash |= 1u64 << i;
         }
     }
@@ -23,17 +21,27 @@ pub fn mean_hash(pixels: &[u8], _width: u32, _height: u32) -> u64 {
 
 /// Median Hash（中值哈希）CPU 参考实现。
 ///
-/// 计算所有像素的中值，每个像素与中值比较生成 1bit。
-/// 当像素数 > 64 时，只取前 64 个像素。
+/// 使用直方图中值算法（与 GPU WGSL 一致），像素 > 中值生成 1bit。
 pub fn median_hash(pixels: &[u8], _width: u32, _height: u32) -> u64 {
     let count = pixels.len().min(64);
-    let mut sorted: Vec<u8> = pixels[..count].to_vec();
-    sorted.sort_unstable();
-    let median = sorted[count / 2];
+    let mut histogram = [0u32; 256];
+    for &pixel in &pixels[..count] {
+        histogram[pixel as usize] += 1;
+    }
+    let half = count as u32 / 2;
+    let mut cum = 0u32;
+    let mut median = 128u32;
+    for v in 0..256u32 {
+        cum += histogram[v as usize];
+        if cum > half {
+            median = v;
+            break;
+        }
+    }
 
     let mut hash: u64 = 0;
     for (i, &pixel) in pixels[..count].iter().enumerate() {
-        if pixel > median {
+        if pixel as u32 > median {
             hash |= 1u64 << i;
         }
     }
@@ -43,7 +51,6 @@ pub fn median_hash(pixels: &[u8], _width: u32, _height: u32) -> u64 {
 /// Gradient Hash（水平梯度哈希）CPU 参考实现。
 ///
 /// 每行相邻像素水平比较，差值 > 0 生成 1bit。
-/// 使用独立 bit_pos 计数器，最多 64bit。
 pub fn gradient_hash(pixels: &[u8], width: u32, height: u32) -> u64 {
     let mut hash: u64 = 0;
     let mut bit_pos: u32 = 0;
@@ -68,7 +75,6 @@ pub fn gradient_hash(pixels: &[u8], width: u32, height: u32) -> u64 {
 /// Vertical Gradient Hash（垂直梯度哈希）CPU 参考实现。
 ///
 /// 每列相邻像素垂直比较，差值 > 0 生成 1bit。
-/// 使用独立 bit_pos 计数器，最多 64bit。
 pub fn vert_gradient_hash(pixels: &[u8], width: u32, height: u32) -> u64 {
     let mut hash: u64 = 0;
     let mut bit_pos: u32 = 0;
@@ -93,14 +99,12 @@ pub fn vert_gradient_hash(pixels: &[u8], width: u32, height: u32) -> u64 {
 /// Block Hash（分块哈希）CPU 参考实现。
 ///
 /// 将图像分为 8x8 块，计算每块均值，相邻块均值比较生成 1bit。
-/// 块大小 = width/8 × height/8。
 pub fn block_hash(pixels: &[u8], width: u32, height: u32) -> u64 {
     let blocks_x = 8u32;
     let blocks_y = 8u32;
     let block_w = width / blocks_x;
     let block_h = height / blocks_y;
 
-    // 计算每块均值
     let mut block_means = Vec::with_capacity(64);
     for by in 0..blocks_y {
         for bx in 0..blocks_x {
@@ -118,7 +122,6 @@ pub fn block_hash(pixels: &[u8], width: u32, height: u32) -> u64 {
         }
     }
 
-    // 相邻块均值比较
     let mut hash: u64 = 0;
     let mut bit_pos: u32 = 0;
     for by in 0..blocks_y {
@@ -141,14 +144,12 @@ pub fn block_hash(pixels: &[u8], width: u32, height: u32) -> u64 {
 /// Double Gradient Hash（双梯度哈希）CPU 参考实现。
 ///
 /// 水平梯度占低 32bit，垂直梯度占高 32bit。
-/// 各自使用独立计数器，最多 32bit。
 pub fn double_gradient_hash(pixels: &[u8], width: u32, height: u32) -> u64 {
     let mut hash_low: u32 = 0;
     let mut hash_high: u32 = 0;
     let mut h_bit_pos: u32 = 0;
     let mut v_bit_pos: u32 = 0;
 
-    // 水平梯度
     for row in 0..height {
         for col in 0..(width - 1) {
             if h_bit_pos >= 32 {
@@ -164,7 +165,6 @@ pub fn double_gradient_hash(pixels: &[u8], width: u32, height: u32) -> u64 {
         }
     }
 
-    // 垂直梯度
     for col in 0..width {
         for row in 0..(height - 1) {
             if v_bit_pos >= 32 {

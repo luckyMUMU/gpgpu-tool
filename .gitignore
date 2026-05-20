@@ -26,3 +26,4 @@ coverage/
 
 # 性能基准测试报告（可选，如果需要保留则注释掉）
 # target/criterion/
+tests/data/

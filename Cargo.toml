@@ -58,3 +58,28 @@ harness = false
 name = "median_hash_bench"
 path = "benches/median_hash_bench.rs"
 harness = false
+
+[[bench]]
+name = "bktree_bench"
+path = "benches/bktree_bench.rs"
+harness = false
+
+[[bench]]
+name = "gpu_utilization_bench"
+path = "benches/gpu_utilization_bench.rs"
+harness = false
+
+[[bench]]
+name = "real_image_bench"
+path = "benches/real_image_bench.rs"
+harness = false
+
+[[bench]]
+name = "gpu_stress_bench"
+path = "benches/gpu_stress_bench.rs"
+harness = false
+
+[[bench]]
+name = "large_scale_bench"
+path = "benches/large_scale_bench.rs"
+harness = false

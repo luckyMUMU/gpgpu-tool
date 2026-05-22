@@ -39,3 +39,4 @@ pub use buffer_pool::BufferPool;
 pub use context::GpuContext;
 pub use error::GpuError;
 pub use pipeline::ComputePipeline;
+pub use tasks::bktree::{BkTree, hamming_distance};

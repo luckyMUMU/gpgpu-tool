@@ -4,10 +4,6 @@ use wgpu::CommandEncoder;
 use crate::buffer::GpuBuffer;
 use crate::error::GpuError;
 
-/// GPU 计算管线，封装 wgpu ComputePipeline 和 BindGroupLayout。
-///
-/// 负责执行 dispatch 操作（构建 bind group、编码命令、提交队列）。
-/// 通过 `GpuContext::get_or_create_pipeline()` 获取，业务层持有 `Arc<ComputePipeline>`。
 pub struct ComputePipeline {
     pipeline: WgpuComputePipeline,
     bind_group_layout: BindGroupLayout,
@@ -15,7 +11,6 @@ pub struct ComputePipeline {
 }
 
 impl ComputePipeline {
-    /// 从 WGSL 源码创建计算管线（编译着色器 + 创建 bind group layout）。
     pub fn create(
         device: &Device,
         wgsl_source: &str,
@@ -90,7 +85,33 @@ impl ComputePipeline {
         })
     }
 
-    /// 执行计算调度：构建 bind group、编码 compute pass、提交队列。
+    fn create_bind_group(
+        &self,
+        device: &Device,
+        input_buffer: &GpuBuffer,
+        output_buffer: &GpuBuffer,
+        params_buffer: &GpuBuffer,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("compute_bind_group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input_buffer.raw().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: output_buffer.raw().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params_buffer.raw().as_entire_binding(),
+                },
+            ],
+        })
+    }
+
     pub fn dispatch(
         &self,
         device: &Device,
@@ -100,83 +121,7 @@ impl ComputePipeline {
         params_buffer: &GpuBuffer,
         dispatch_count: [u32; 3],
     ) {
-        let encoder = self.encode_dispatch(
-            device,
-            input_buffer,
-            output_buffer,
-            params_buffer,
-            dispatch_count,
-        );
-        queue.submit(std::iter::once(encoder.finish()));
-    }
-
-    /// 编码计算调度到大 encoder 中（不提交），用于批量提交场景。
-    pub fn encode_dispatch_into(
-        &self,
-        device: &Device,
-        encoder: &mut CommandEncoder,
-        input_buffer: &GpuBuffer,
-        output_buffer: &GpuBuffer,
-        params_buffer: &GpuBuffer,
-        dispatch_count: [u32; 3],
-    ) {
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("compute_bind_group"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: input_buffer.raw().as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: output_buffer.raw().as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: params_buffer.raw().as_entire_binding(),
-                },
-            ],
-        });
-
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("compute_pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(dispatch_count[0], dispatch_count[1], dispatch_count[2]);
-        }
-    }
-
-    /// 编码计算调度到独立 encoder 中，返回 encoder（调用者负责 submit）。
-    fn encode_dispatch(
-        &self,
-        device: &Device,
-        input_buffer: &GpuBuffer,
-        output_buffer: &GpuBuffer,
-        params_buffer: &GpuBuffer,
-        dispatch_count: [u32; 3],
-    ) -> CommandEncoder {
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("compute_bind_group"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: input_buffer.raw().as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: output_buffer.raw().as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: params_buffer.raw().as_entire_binding(),
-                },
-            ],
-        });
+        let bind_group = self.create_bind_group(device, input_buffer, output_buffer, params_buffer);
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("dispatch_encoder"),
@@ -192,7 +137,29 @@ impl ComputePipeline {
             pass.dispatch_workgroups(dispatch_count[0], dispatch_count[1], dispatch_count[2]);
         }
 
-        encoder
+        queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    pub fn encode_dispatch_into(
+        &self,
+        device: &Device,
+        encoder: &mut CommandEncoder,
+        input_buffer: &GpuBuffer,
+        output_buffer: &GpuBuffer,
+        params_buffer: &GpuBuffer,
+        dispatch_count: [u32; 3],
+    ) {
+        let bind_group = self.create_bind_group(device, input_buffer, output_buffer, params_buffer);
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("compute_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(dispatch_count[0], dispatch_count[1], dispatch_count[2]);
+        }
     }
 
     pub fn workgroup_size(&self) -> [u32; 3] {

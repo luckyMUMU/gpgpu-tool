@@ -1,12 +1,13 @@
 use crate::context::GpuContext;
 use crate::error::GpuError;
-use crate::tasks::hash_common::PerceptualHashComputer;
+use crate::tasks::hash_common::{PerceptualHashComputer, compute_phash_from_gpu_buffer};
 use crate::tasks::mean_hash::MeanHashComputer;
 use crate::tasks::median_hash::MedianHashComputer;
 use crate::tasks::gradient_hash::GradientHashComputer;
 use crate::tasks::block_hash::BlockHashComputer;
 use crate::tasks::vert_gradient_hash::VertGradientHashComputer;
 use crate::tasks::double_gradient_hash::DoubleGradientHashComputer;
+use crate::tasks::gpu_resize::GpuResize;
 
 /// 感知哈希算法类型。
 #[derive(Debug, Clone, Copy)]
@@ -56,11 +57,24 @@ pub struct PerceptualHasher {
     target_width: u32,
     target_height: u32,
     computer: Box<dyn PerceptualHashComputer>,
+    gpu_resize: Option<GpuResize>,
 }
 
 impl PerceptualHasher {
-    /// 创建感知哈希计算器。
+    /// 创建感知哈希计算器（使用 CPU 缩放）。
     pub fn new(ctx: &mut GpuContext, algorithm: HashAlgorithm) -> Result<Self, GpuError> {
+        Self::with_resize_mode(ctx, algorithm, false)
+    }
+
+    /// 创建感知哈希计算器，指定是否使用 GPU 缩放。
+    ///
+    /// `use_gpu_resize = true` 时，图像缩放将在 GPU 上通过 compute shader 完成，
+    /// 适合大批量大图场景，可显著减少 CPU 负载。
+    pub fn with_resize_mode(
+        ctx: &mut GpuContext,
+        algorithm: HashAlgorithm,
+        use_gpu_resize: bool,
+    ) -> Result<Self, GpuError> {
         let (w, h) = algorithm.target_size();
         let computer: Box<dyn PerceptualHashComputer> = match algorithm {
             HashAlgorithm::Mean => Box::new(MeanHashComputer::new(ctx)?),
@@ -70,11 +84,17 @@ impl PerceptualHasher {
             HashAlgorithm::VertGradient => Box::new(VertGradientHashComputer::new(ctx)?),
             HashAlgorithm::DoubleGradient => Box::new(DoubleGradientHashComputer::new(ctx)?),
         };
+        let gpu_resize = if use_gpu_resize {
+            Some(GpuResize::new(ctx)?)
+        } else {
+            None
+        };
         Ok(Self {
             algorithm,
             target_width: w,
             target_height: h,
             computer,
+            gpu_resize,
         })
     }
 
@@ -93,6 +113,9 @@ impl PerceptualHasher {
     /// `images` 中每个元素为一张图像的灰度像素（宽×高字节），
     /// `dimensions` 为对应图像的 (width, height)。
     /// 内部自动缩放到目标尺寸后计算。
+    ///
+    /// 如果构造时启用了 GPU 缩放（`use_gpu_resize = true`），
+    /// 则所有输入图像必须具有相同的源尺寸。
     pub fn compute(
         &self,
         ctx: &GpuContext,
@@ -105,6 +128,68 @@ impl PerceptualHasher {
             ));
         }
 
+        if images.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // 检查是否所有图像已经是目标尺寸
+        let all_target_size = dimensions.iter().all(|&(w, h)| {
+            w == self.target_width && h == self.target_height
+        });
+
+        if all_target_size {
+            return self.computer.compute(ctx, images);
+        }
+
+        // 检查是否所有图像尺寸相同（GPU 缩放要求）
+        let all_same_size = dimensions.windows(2).all(|w| w[0] == w[1]);
+
+        if let Some(ref gpu_resize) = self.gpu_resize {
+            if all_same_size {
+                let (src_w, src_h) = dimensions[0];
+                let src_pixels = (src_w * src_h) as usize;
+                let dst_pixels = (self.target_width * self.target_height) as usize;
+                let src_u32_per_image = src_pixels.div_ceil(4) as u64;
+                let dst_u32_per_image = dst_pixels as u64;
+                let u32_per_image = src_u32_per_image + dst_u32_per_image;
+                let max_batch = if u32_per_image > 0 {
+                    ((256 * 1024 * 1024 / 2) / (u32_per_image * 4)).max(1) as usize
+                } else {
+                    images.len()
+                };
+
+                let mut all_hashes = Vec::with_capacity(images.len());
+                for chunk_start in (0..images.len()).step_by(max_batch) {
+                    let chunk_end = (chunk_start + max_batch).min(images.len());
+                    let chunk_images = &images[chunk_start..chunk_end];
+                    let chunk_dims = &dimensions[chunk_start..chunk_end];
+
+                    let (resized_buffer, resized_u32_count) = gpu_resize.resize_batch_gpu(
+                        ctx,
+                        chunk_images,
+                        chunk_dims,
+                        self.target_width,
+                        self.target_height,
+                    )?;
+                    let hashes = compute_phash_from_gpu_buffer(
+                        self.computer.pipeline(),
+                        ctx,
+                        &resized_buffer,
+                        resized_u32_count,
+                        chunk_images.len(),
+                        self.target_width,
+                        self.target_height,
+                        self.computer.workgroup_size(),
+                        gpu_resize.buffer_pool(),
+                    )?;
+                    gpu_resize.buffer_pool().release(resized_buffer.into_raw());
+                    all_hashes.extend(hashes);
+                }
+                return Ok(all_hashes);
+            }
+        }
+
+        // 回退到 CPU 缩放（支持不同尺寸）
         let resized: Vec<Vec<u8>> = images
             .iter()
             .zip(dimensions.iter())
@@ -136,28 +221,34 @@ fn resize_grayscale(
         return pixels.to_vec();
     }
 
-    let mut output = Vec::with_capacity((dst_w * dst_h) as usize);
+    let sw = src_w as usize;
+    let sh = src_h as usize;
+    let stride = sw + 1;
+
+    let mut sat = vec![0u64; (sh + 1) * stride];
+    for y in 0..sh {
+        let mut row_sum = 0u64;
+        for x in 0..sw {
+            row_sum += pixels[y * sw + x] as u64;
+            sat[(y + 1) * stride + (x + 1)] = row_sum + sat[y * stride + (x + 1)];
+        }
+    }
 
     let x_ratio = src_w as f64 / dst_w as f64;
     let y_ratio = src_h as f64 / dst_h as f64;
+    let mut output = Vec::with_capacity((dst_w * dst_h) as usize);
 
     for dy in 0..dst_h {
-        let src_y_start = (dy as f64 * y_ratio) as u32;
-        let src_y_end = ((dy + 1) as f64 * y_ratio).min(src_h as f64) as u32;
-        let y_count = (src_y_end - src_y_start).max(1);
-
+        let y0 = (dy as f64 * y_ratio) as usize;
+        let y1 = ((dy as f64 + 1.0) * y_ratio).min(src_h as f64) as usize;
         for dx in 0..dst_w {
-            let src_x_start = (dx as f64 * x_ratio) as u32;
-            let src_x_end = ((dx + 1) as f64 * x_ratio).min(src_w as f64) as u32;
-            let x_count = (src_x_end - src_x_start).max(1);
-
-            let mut sum: u32 = 0;
-            for sy in src_y_start..src_y_end {
-                for sx in src_x_start..src_x_end {
-                    sum += pixels[(sy * src_w + sx) as usize] as u32;
-                }
-            }
-            output.push((sum / (x_count * y_count)) as u8);
+            let x0 = (dx as f64 * x_ratio) as usize;
+            let x1 = ((dx as f64 + 1.0) * x_ratio).min(src_w as f64) as usize;
+            let top_right = sat[y1 * stride + x1] - sat[y0 * stride + x1];
+            let bottom_right = sat[y1 * stride + x0] - sat[y0 * stride + x0];
+            let sum = top_right - bottom_right;
+            let area = ((x1 - x0) * (y1 - y0)).max(1);
+            output.push((sum / area as u64) as u8);
         }
     }
 

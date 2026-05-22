@@ -127,7 +127,7 @@ impl GpuBatchSubmitter {
         // 映射 staging buffer 读取结果
         let mut results = Vec::with_capacity(self.pending.len());
 
-        for pending in self.pending.drain(..) {
+        for pending in &self.pending {
             pending
                 .staging_buffer
                 .slice(..)
@@ -136,9 +136,11 @@ impl GpuBatchSubmitter {
                         log::error!("批量 staging buffer 映射失败: {}", e);
                     }
                 });
+        }
 
-            device.poll(wgpu::Maintain::Wait);
+        device.poll(wgpu::Maintain::Wait);
 
+        for pending in self.pending.drain(..) {
             let view = pending.staging_buffer.slice(..).get_mapped_range();
             let data = view.to_vec();
             drop(view);

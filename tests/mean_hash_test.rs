@@ -11,15 +11,19 @@ use common::test_data;
 
 use std::time::Instant;
 
-fn get_gpu_info() -> String {
-    let ctx = GpuContext::new_sync().expect("GPU 初始化失败");
+fn get_gpu_info(ctx: &GpuContext) -> String {
     ctx.adapter_info()
 }
 
 #[test]
-#[ignore]
 fn test_mean_hash_single_8x8() {
-    let mut ctx = GpuContext::new_sync().expect("GPU 初始化失败");
+    let mut ctx = match GpuContext::new_sync() {
+        Ok(ctx) => ctx,
+        Err(_) => {
+            eprintln!("GPU 不可用，跳过测试");
+            return;
+        }
+    };
     let hasher = MeanHashComputer::new(&mut ctx).expect("创建失败");
 
     let image = test_data::gradient_image(64);
@@ -32,7 +36,13 @@ fn test_mean_hash_single_8x8() {
 #[test]
 #[ignore]
 fn test_mean_hash_single_16x16() {
-    let mut ctx = GpuContext::new_sync().expect("GPU 初始化失败");
+    let mut ctx = match GpuContext::new_sync() {
+        Ok(ctx) => ctx,
+        Err(_) => {
+            eprintln!("GPU 不可用，跳过测试");
+            return;
+        }
+    };
     let hasher = MeanHashComputer::new(&mut ctx).expect("创建失败");
 
     let image = test_data::gradient_image(256);
@@ -43,13 +53,18 @@ fn test_mean_hash_single_16x16() {
 }
 
 #[test]
-#[ignore]
 fn test_mean_hash_batch() {
-    let mut ctx = GpuContext::new_sync().expect("GPU 初始化失败");
+    let mut ctx = match GpuContext::new_sync() {
+        Ok(ctx) => ctx,
+        Err(_) => {
+            eprintln!("GPU 不可用，跳过测试");
+            return;
+        }
+    };
     let hasher = MeanHashComputer::new(&mut ctx).expect("创建失败");
 
     let images: Vec<Vec<u8>> = (0..10)
-        .map(|i| test_data::random_image(64 + i))
+        .map(|_| test_data::random_image(64))
         .collect();
 
     let gpu_hashes = hasher.compute(&ctx, &images).expect("计算失败");
@@ -61,9 +76,14 @@ fn test_mean_hash_batch() {
 }
 
 #[test]
-#[ignore]
 fn test_mean_hash_empty() {
-    let mut ctx = GpuContext::new_sync().expect("GPU 初始化失败");
+    let mut ctx = match GpuContext::new_sync() {
+        Ok(ctx) => ctx,
+        Err(_) => {
+            eprintln!("GPU 不可用，跳过测试");
+            return;
+        }
+    };
     let hasher = MeanHashComputer::new(&mut ctx).expect("创建失败");
 
     let result = hasher.compute(&ctx, &[]).expect("计算失败");
@@ -71,12 +91,17 @@ fn test_mean_hash_empty() {
 }
 
 #[test]
-#[ignore]
 fn test_mean_hash_full_report() {
-    let gpu_info = get_gpu_info();
+    let mut ctx = match GpuContext::new_sync() {
+        Ok(ctx) => ctx,
+        Err(_) => {
+            eprintln!("GPU 不可用，跳过测试");
+            return;
+        }
+    };
+    let gpu_info = get_gpu_info(&ctx);
     let mut report = TestReport::new(gpu_info);
 
-    let mut ctx = GpuContext::new_sync().expect("GPU 初始化失败");
     let hasher = MeanHashComputer::new(&mut ctx).expect("创建失败");
 
     // 功能测试
@@ -91,7 +116,7 @@ fn test_mean_hash_full_report() {
 
     // 批量测试
     let batch_images: Vec<Vec<u8>> = (0..10)
-        .map(|i| test_data::random_image(64 + i * 10))
+        .map(|_| test_data::random_image(64))
         .collect();
     let gpu_hashes = hasher.compute(&ctx, &batch_images).expect("计算失败");
     let all_match = batch_images.iter().enumerate().all(|(i, img)| {

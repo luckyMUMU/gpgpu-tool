@@ -1,5 +1,7 @@
+pub mod bktree;
 pub mod block_hash;
 pub mod double_gradient_hash;
+pub mod gpu_resize;
 pub mod gradient_hash;
 pub mod hash_common;
 pub mod mean_hash;

@@ -1,4 +1,5 @@
 use crate::buffer::{BufferUsage, GpuBuffer};
+use crate::buffer_pool::BufferPool;
 use crate::context::GpuContext;
 use crate::error::GpuError;
 use crate::pipeline::ComputePipeline;
@@ -25,19 +26,14 @@ pub struct PhashParams {
 /// 所有感知哈希算法（Mean、Gradient、Block 等）均实现此 trait，
 /// 便于上层通过多态方式调用不同算法。
 pub trait PerceptualHashComputer {
-    /// 批量计算感知哈希。
-    ///
-    /// # 参数
-    /// - `ctx`: GPU 上下文
-    /// - `images`: 每幅图像的原始像素字节序列，所有图像尺寸须一致
-    ///
-    /// # 返回
-    /// 每幅图像对应的 64bit 哈希值数组
     fn compute(
         &self,
         ctx: &GpuContext,
         images: &[Vec<u8>],
     ) -> Result<Vec<u64>, GpuError>;
+
+    fn pipeline(&self) -> &ComputePipeline;
+    fn workgroup_size(&self) -> [u32; 3];
 }
 
 /// 通用感知哈希 GPU 计算流程。
@@ -51,6 +47,7 @@ pub fn compute_phash(
     width: u32,
     height: u32,
     workgroup_size: [u32; 3],
+    buffer_pool: &BufferPool,
 ) -> Result<Vec<u64>, GpuError> {
     if images.is_empty() {
         return Ok(vec![]);
@@ -69,14 +66,23 @@ pub fn compute_phash(
                 "所有图像尺寸必须一致".to_string(),
             ));
         }
-        for &pixel in img {
-            all_pixels.push(pixel as u32);
+        let start = all_pixels.len();
+        all_pixels.resize(start + img.len(), 0);
+        for (i, &pixel) in img.iter().enumerate() {
+            all_pixels[start + i] = pixel as u32;
         }
     }
 
-    let input_buffer = GpuBuffer::from_data(device, &all_pixels, BufferUsage::Storage);
+    let input_size = (all_pixels.len() * 4) as u64;
     let output_size = (image_count * 2 * 4) as u64;
-    let output_buffer = GpuBuffer::empty(device, output_size, BufferUsage::Storage);
+
+    let input_buffer_raw = buffer_pool.acquire(device, input_size, BufferUsage::Storage);
+    let output_buffer_raw = buffer_pool.acquire(device, output_size, BufferUsage::Storage);
+
+    queue.write_buffer(&input_buffer_raw, 0, bytemuck::cast_slice(&all_pixels));
+
+    let input_buffer = GpuBuffer::from_raw(input_buffer_raw, input_size);
+    let output_buffer = GpuBuffer::from_raw(output_buffer_raw, output_size);
 
     let params = PhashParams {
         image_count: image_count as u32,
@@ -96,7 +102,75 @@ pub fn compute_phash(
         [dispatch_x, 1, 1],
     );
 
-    let result = output_buffer.download(device, queue)?;
+    let result = output_buffer.download_with_pool(device, queue, buffer_pool)?;
+
+    buffer_pool.release(input_buffer.into_raw());
+    buffer_pool.release(output_buffer.into_raw());
+
+    let raw_u32 = bytemuck::cast_slice::<u8, u32>(&result);
+
+    let mut hashes = Vec::with_capacity(image_count);
+    for i in 0..image_count {
+        let low = raw_u32[i * 2] as u64;
+        let high = raw_u32[i * 2 + 1] as u64;
+        hashes.push(low | (high << 32));
+    }
+
+    Ok(hashes)
+}
+
+/// 通用感知哈希 GPU 计算流程（从 GPU buffer 输入）。
+///
+/// 与 `compute_phash` 相同的计算逻辑，但输入数据已在 GPU buffer 中，
+/// 避免了 CPU→GPU 的数据传输。适用于 GPU 缩放→GPU 哈希的零拷贝流水线。
+///
+/// `input_buffer` 应包含打包后的 u32 像素数据，
+/// `input_u32_count` 为 u32 元素总数。
+#[allow(clippy::too_many_arguments)]
+pub fn compute_phash_from_gpu_buffer(
+    pipeline: &ComputePipeline,
+    ctx: &GpuContext,
+    input_buffer: &GpuBuffer,
+    _input_u32_count: usize,
+    image_count: usize,
+    width: u32,
+    height: u32,
+    workgroup_size: [u32; 3],
+    buffer_pool: &BufferPool,
+) -> Result<Vec<u64>, GpuError> {
+    if image_count == 0 {
+        return Ok(vec![]);
+    }
+
+    let device = ctx.device();
+    let queue = ctx.queue();
+    let output_size = (image_count * 2 * 4) as u64;
+
+    let output_buffer_raw = buffer_pool.acquire(device, output_size, BufferUsage::Storage);
+    let output_buffer = GpuBuffer::from_raw(output_buffer_raw, output_size);
+
+    let params = PhashParams {
+        image_count: image_count as u32,
+        width,
+        height,
+        _padding: 0,
+    };
+    let params_buffer = GpuBuffer::from_data(device, &[params], BufferUsage::Uniform);
+
+    let dispatch_x = (image_count as u32).div_ceil(workgroup_size[0]).max(1);
+    pipeline.dispatch(
+        device,
+        queue,
+        input_buffer,
+        &output_buffer,
+        &params_buffer,
+        [dispatch_x, 1, 1],
+    );
+
+    let result = output_buffer.download_with_pool(device, queue, buffer_pool)?;
+
+    buffer_pool.release(output_buffer.into_raw());
+
     let raw_u32 = bytemuck::cast_slice::<u8, u32>(&result);
 
     let mut hashes = Vec::with_capacity(image_count);
@@ -118,6 +192,7 @@ macro_rules! declare_phash_computer {
         pub struct $name {
             pipeline: ::std::sync::Arc<$crate::pipeline::ComputePipeline>,
             workgroup_size: [u32; 3],
+            buffer_pool: $crate::buffer_pool::BufferPool,
         }
 
         impl $name {
@@ -135,7 +210,16 @@ macro_rules! declare_phash_computer {
                 Ok(Self {
                     pipeline: ::std::sync::Arc::clone(&pipeline),
                     workgroup_size,
+                    buffer_pool: $crate::buffer_pool::BufferPool::new(),
                 })
+            }
+
+            pub fn pipeline(&self) -> &$crate::pipeline::ComputePipeline {
+                &self.pipeline
+            }
+
+            pub fn workgroup_size_val(&self) -> [u32; 3] {
+                self.workgroup_size
             }
         }
     };
@@ -157,7 +241,17 @@ macro_rules! impl_phash_computer_simple {
                 let pixels_per_image = images[0].len();
                 let width = (pixels_per_image as u32).isqrt();
                 let height = width;
-                $crate::tasks::hash_common::compute_phash(&self.pipeline, ctx, images, width, height, self.workgroup_size)
+                $crate::tasks::hash_common::compute_phash(
+                    &self.pipeline, ctx, images, width, height, self.workgroup_size, &self.buffer_pool,
+                )
+            }
+
+            fn pipeline(&self) -> &$crate::pipeline::ComputePipeline {
+                &self.pipeline
+            }
+
+            fn workgroup_size(&self) -> [u32; 3] {
+                self.workgroup_size
             }
         }
     };
@@ -179,12 +273,10 @@ macro_rules! impl_phash_computer_custom_dims {
                 let pixels_per_image = images[0].len() as u32;
                 let (width, height) = match $mode {
                     0 => {
-                        // width > height, e.g. 8x9 水平梯度
                         let w = pixels_per_image.div_ceil(9);
                         (w, pixels_per_image / w)
                     }
                     1 => {
-                        // height > width, e.g. 9x8 垂直梯度
                         let h = pixels_per_image.div_ceil(9);
                         (pixels_per_image / h, h)
                     }
@@ -194,8 +286,16 @@ macro_rules! impl_phash_computer_custom_dims {
                     }
                 };
                 $crate::tasks::hash_common::compute_phash(
-                    &self.pipeline, ctx, images, width, height, self.workgroup_size,
+                    &self.pipeline, ctx, images, width, height, self.workgroup_size, &self.buffer_pool,
                 )
+            }
+
+            fn pipeline(&self) -> &$crate::pipeline::ComputePipeline {
+                &self.pipeline
+            }
+
+            fn workgroup_size(&self) -> [u32; 3] {
+                self.workgroup_size
             }
         }
     };

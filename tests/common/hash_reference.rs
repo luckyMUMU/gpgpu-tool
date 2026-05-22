@@ -124,6 +124,8 @@ pub fn block_hash(pixels: &[u8], width: u32, height: u32) -> u64 {
 
     let mut hash: u64 = 0;
     let mut bit_pos: u32 = 0;
+
+    // 水平比较：8行 × 7比较 = 56 bit
     for by in 0..blocks_y {
         for bx in 0..(blocks_x - 1) {
             if bit_pos >= 64 {
@@ -138,6 +140,21 @@ pub fn block_hash(pixels: &[u8], width: u32, height: u32) -> u64 {
             bit_pos += 1;
         }
     }
+
+    // 垂直比较：第0行与第1行 = 8 bit，补足 64 bit
+    for bx in 0..blocks_x {
+        if bit_pos >= 64 {
+            break;
+        }
+        let idx = (0 * blocks_x + bx) as usize;
+        let current = block_means[idx];
+        let below = block_means[idx + blocks_x as usize];
+        if below > current {
+            hash |= 1u64 << bit_pos;
+        }
+        bit_pos += 1;
+    }
+
     hash
 }
 

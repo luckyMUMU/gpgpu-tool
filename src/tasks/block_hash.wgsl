@@ -42,11 +42,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    // 相邻块均值比较生成 64bit 哈希
     var hash_low: u32 = 0u;
     var hash_high: u32 = 0u;
     var bit_pos: u32 = 0u;
 
+    // 水平比较：8行 × 7比较 = 56 bit
     for (var by = 0u; by < blocks_y; by = by + 1u) {
         for (var bx = 0u; bx < blocks_x - 1u; bx = bx + 1u) {
             if (bit_pos >= 64u) {
@@ -64,6 +64,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
             bit_pos = bit_pos + 1u;
         }
+    }
+
+    // 垂直比较：第0行与第1行 = 8 bit，补足 64 bit
+    for (var bx = 0u; bx < blocks_x; bx = bx + 1u) {
+        if (bit_pos >= 64u) {
+            break;
+        }
+        let idx = 0u * blocks_x + bx;
+        let current = block_means[idx];
+        let below = block_means[idx + blocks_x];
+        let bit = select(0u, 1u, below > current);
+
+        if (bit_pos < 32u) {
+            hash_low = hash_low | (bit << bit_pos);
+        } else {
+            hash_high = hash_high | (bit << (bit_pos - 32u));
+        }
+        bit_pos = bit_pos + 1u;
     }
 
     let out_base = img_idx * 2u;

@@ -348,7 +348,7 @@ impl<'a> Sha256BatchSubmitter<'a> {
             self.pending_batches.iter().map(|b| b.message_count).sum(),
         );
 
-        for pending in self.pending_batches.drain(..) {
+        for pending in &self.pending_batches {
             pending
                 .staging_buffer
                 .slice(..)
@@ -357,9 +357,11 @@ impl<'a> Sha256BatchSubmitter<'a> {
                         log::error!("批量 staging buffer 映射失败: {}", e);
                     }
                 });
+        }
 
-            self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll(wgpu::Maintain::Wait);
 
+        for pending in self.pending_batches.drain(..) {
             let view = pending.staging_buffer.slice(..).get_mapped_range();
             let data = view.to_vec();
             drop(view);

@@ -9,9 +9,14 @@ use common::hash_reference;
 use common::test_data;
 
 #[test]
-#[ignore]
 fn test_double_gradient_hash_single_9x9() {
-    let mut ctx = GpuContext::new_sync().expect("GPU 初始化失败");
+    let mut ctx = match GpuContext::new_sync() {
+        Ok(ctx) => ctx,
+        Err(_) => {
+            eprintln!("GPU 不可用，跳过测试");
+            return;
+        }
+    };
     let hasher = DoubleGradientHashComputer::new(&mut ctx).expect("创建失败");
 
     let image = test_data::gradient_image(81);
@@ -22,9 +27,14 @@ fn test_double_gradient_hash_single_9x9() {
 }
 
 #[test]
-#[ignore]
 fn test_double_gradient_hash_single_17x17() {
-    let mut ctx = GpuContext::new_sync().expect("GPU 初始化失败");
+    let mut ctx = match GpuContext::new_sync() {
+        Ok(ctx) => ctx,
+        Err(_) => {
+            eprintln!("GPU 不可用，跳过测试");
+            return;
+        }
+    };
     let hasher = DoubleGradientHashComputer::new(&mut ctx).expect("创建失败");
 
     let image = test_data::gradient_image(289);
@@ -35,13 +45,18 @@ fn test_double_gradient_hash_single_17x17() {
 }
 
 #[test]
-#[ignore]
 fn test_double_gradient_hash_batch() {
-    let mut ctx = GpuContext::new_sync().expect("GPU 初始化失败");
+    let mut ctx = match GpuContext::new_sync() {
+        Ok(ctx) => ctx,
+        Err(_) => {
+            eprintln!("GPU 不可用，跳过测试");
+            return;
+        }
+    };
     let hasher = DoubleGradientHashComputer::new(&mut ctx).expect("创建失败");
 
     let images: Vec<Vec<u8>> = (0..10)
-        .map(|i| test_data::random_image(81 + i))
+        .map(|_| test_data::random_image(81))
         .collect();
 
     let gpu_hashes = hasher.compute(&ctx, &images).expect("计算失败");
@@ -53,9 +68,14 @@ fn test_double_gradient_hash_batch() {
 }
 
 #[test]
-#[ignore]
 fn test_double_gradient_hash_empty() {
-    let mut ctx = GpuContext::new_sync().expect("GPU 初始化失败");
+    let mut ctx = match GpuContext::new_sync() {
+        Ok(ctx) => ctx,
+        Err(_) => {
+            eprintln!("GPU 不可用，跳过测试");
+            return;
+        }
+    };
     let hasher = DoubleGradientHashComputer::new(&mut ctx).expect("创建失败");
 
     let result = hasher.compute(&ctx, &[]).expect("计算失败");

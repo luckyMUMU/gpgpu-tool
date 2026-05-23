@@ -26,6 +26,25 @@ const BLOCK_U32_COUNT: usize = 16;
 const HASH_U32_COUNT: usize = 8;
 const MAX_SINGLE_BLOCK_MSG_LEN: usize = 55;
 
+/// SHA-256 并行哈希计算器，基于 GPU compute shader 实现。
+///
+/// 支持批量处理任意数量的消息，每条消息长度不超过 55 字节时使用单 block 模式，
+/// 更长的消息自动切换为多 block 流水线模式。
+///
+/// # 示例
+///
+/// ```no_run
+/// use wgpu_compute_engine::{GpuContext, tasks::sha256::Sha256Computer};
+///
+/// let mut ctx = GpuContext::new_sync().unwrap();
+/// let sha256 = Sha256Computer::new(&mut ctx).unwrap();
+///
+/// let messages = vec![
+///     b"hello".to_vec(),
+///     b"world".to_vec(),
+/// ];
+/// let hashes = sha256.compute(&ctx, &messages).unwrap();
+/// ```
 pub struct Sha256Computer {
     pipeline: Arc<ComputePipeline>,
     workgroup_size: [u32; 3],
@@ -39,6 +58,18 @@ pub struct Sha256Computer {
 /// 所有单 block dispatch + copy 命令编码到同一个 CommandEncoder，
 /// 最终通过一次 `queue.submit()` 统一提交。
 /// 多 block 消息由于数据依赖仍需同步等待中间结果。
+///
+/// # 使用方式
+///
+/// ```no_run
+/// use wgpu_compute_engine::{GpuContext, tasks::sha256::Sha256Computer};
+///
+/// let mut ctx = GpuContext::new_sync().unwrap();
+/// let sha256 = Sha256Computer::new(&mut ctx).unwrap();
+/// let mut submitter = sha256.batch_submit(&ctx);
+/// // ... 添加任务
+/// let hashes = submitter.finish().unwrap();
+/// ```
 pub struct Sha256BatchSubmitter<'a> {
     computer: &'a Sha256Computer,
     device: &'a wgpu::Device,

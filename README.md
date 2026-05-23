@@ -1,143 +1,131 @@
 # wgpu-compute-engine
 
-基于 [wgpu](https://github.com/gfx-rs/wgpu) 的跨平台 GPU 通用计算引擎，为 CPU 密集型任务提供 GPU 并行加速能力。
+基于 [wgpu](https://github.com/gfx-rs/wgpu) 的跨平台 GPU 并行加速引擎。
 
-## 特性
+为 CPU 密集型计算任务提供 GPU 并行加速能力，开箱即用，无需手写 WGSL 着色器。
 
-- **跨平台**：基于 wgpu，支持 Vulkan、Metal、DX12、WebGPU
-- **架构分层**：能力层（GPU 上下文、缓冲区、管线）与业务层（具体算法）解耦
-- **管线缓存**：自动缓存编译后的着色器，避免重复编译
-- **异步批量提交**：`GpuBatchSubmitter` 将多次 CPU-GPU 同步合并为一次，显著降低调度开销
-- **缓冲区池化**：`BufferPool` 按尺寸分档复用 GPU 缓冲区，减少分配开销
+---
 
-## 架构
+## 能力
 
-```
-┌─────────────────────────────────────────┐
-│           业务层 (Business)              │
-│  ┌──────────┐ ┌──────────┐ ┌─────────┐ │
-│  │ SHA-256  │ │ 图像哈希 │ │  待扩展  │ │
-│  └────┬─────┘ └────┬─────┘ └────┬────┘ │
-└───────┼────────────┼────────────┼──────┘
-        │            │            │
-┌───────┼────────────┼────────────┼──────┐
-│       ▼            ▼            ▼      │
-│      能力层 (Capability Layer)          │
-│  ┌──────────┐ ┌──────────┐ ┌─────────┐ │
-│  │GpuContext│ │GpuBuffer │ │Compute  │ │
-│  │(设备/队列│ │(缓冲区管 │ │Pipeline │ │
-│  │/管线缓存)│ │理/传输) │ │(调度)   │ │
-│  └──────────┘ └──────────┘ └─────────┘ │
-│  ┌──────────┐ ┌──────────┐             │
-│  │BufferPool│ │GpuBatch  │             │
-│  │(缓冲区复 │ │Submitter │             │
-│  │ 用)      │ │(异步提交)│             │
-│  └──────────┘ └──────────┘             │
-└─────────────────────────────────────────┘
-                    │
-                    ▼
-              wgpu (Vulkan/Metal/DX12)
-```
+| 能力 | 说明 | 入口 |
+|------|------|------|
+| SHA-256 并行哈希 | GPU 并行计算 SHA-256，批量处理任意数量消息 | [`Sha256Computer`](src/tasks/sha256.rs) |
+| 感知哈希 (pHash) | 6 种算法（Mean/Median/Gradient/Block/DoubleGradient/VertGradient） | [`PerceptualHasher`](src/tasks/phasher.rs) |
+| BK-tree 近似搜索 | 基于汉明距离的最近邻搜索，O(log N) 复杂度 | [`BkTree`](src/tasks/bktree.rs) |
+| GPU 批量缩放 | 计算 shader 实现的 box filter 缩放，支持零拷贝流水线 | `PerceptualHasher::with_resize_mode()` |
+| 异步批量提交 | 将多次 dispatch 合并为一次 GPU submit，降调度开销 | [`GpuBatchSubmitter`](src/batch.rs) |
+| 缓冲区复用池 | 按尺寸分档的缓冲区缓存，减少重复分配 | [`BufferPool`](src/buffer_pool.rs) |
 
 ## 快速开始
 
-### 同步接口
+### SHA-256
 
 ```rust
 use wgpu_compute_engine::{GpuContext, tasks::sha256::Sha256Computer};
 
-let mut ctx = GpuContext::new_sync()?;
-let sha256 = Sha256Computer::new(&mut ctx)?;
+let mut ctx = GpuContext::new_sync().unwrap();
+let sha256 = Sha256Computer::new(&mut ctx).unwrap();
 
 let messages = vec![b"hello".to_vec(), b"world".to_vec()];
-let hashes = sha256.compute(&ctx, &messages)?;
-
-for (i, hash) in hashes.iter().enumerate() {
-    println!("消息 {}: {:02x?}", i, hash);
-}
+let hashes = sha256.compute(&ctx, &messages).unwrap();
 ```
 
-### 异步批量接口（推荐）
+### 感知哈希（图像相似度）
 
 ```rust
-let mut ctx = GpuContext::new_sync()?;
-let sha256 = Sha256Computer::new(&mut ctx)?;
+use wgpu_compute_engine::{GpuContext, tasks::phasher::{PerceptualHasher, HashAlgorithm}};
 
-let mut submitter = sha256.batch_submitter(&ctx);
+let mut ctx = GpuContext::new_sync().unwrap();
+let hasher = PerceptualHasher::new(&mut ctx, HashAlgorithm::Mean).unwrap();
 
-// 多次提交，不阻塞
-submitter.submit(&vec![b"batch1".to_vec()])?;
-submitter.submit(&vec![b"batch2".to_vec()])?;
-submitter.submit(&vec![b"batch3".to_vec()])?;
-
-// 统一等待所有结果
-let results = submitter.wait_all()?;
-// results: Vec<(usize, [u8; 32])>
+// 任意尺寸的灰度图像，内部自动缩放到算法目标尺寸
+let images = vec![vec![128u8; 256 * 256]];
+let dimensions = vec![(256u32, 256u32)];
+let hashes = hasher.compute(&ctx, &images, &dimensions).unwrap();
 ```
 
-### 运行示例
+### GPU 加速缩放 + 哈希（零拷贝流水线）
+
+```rust
+use wgpu_compute_engine::{GpuContext, tasks::phasher::{PerceptualHasher, HashAlgorithm}};
+
+let mut ctx = GpuContext::new_sync().unwrap();
+
+// use_gpu_resize = true 启用 GPU 端缩放
+let hasher = PerceptualHasher::with_resize_mode(
+    &mut ctx, HashAlgorithm::Mean, true,
+).unwrap();
+
+let images = vec![vec![128u8; 1024 * 1024]];
+let dimensions = vec![(1024u32, 1024u32)];
+let hashes = hasher.compute(&ctx, &images, &dimensions).unwrap();
+```
+
+### BK-tree 近似图像检索
+
+```rust
+use wgpu_compute_engine::tasks::bktree::{BkTree, hamming_distance};
+
+let hashes = vec![0xA1B2C3D4, 0x12345678, 0x87654321];
+let tree = BkTree::from_hashes(hashes.iter().copied());
+
+// 查找汉明距离 ≤ 5 的近似图像
+let similar = tree.find(0xA1B2C3D4, 5);
+// 查找最近邻
+let nearest = tree.find_nearest(0xA1B2C3D4);
+```
+
+## 特性
+
+| Feature | 说明 |
+|---------|------|
+| `image` | 启用 `image` crate 集成，支持直接从 `DynamicImage` 计算哈希 |
+
+## 架构
+
+```
+src/
+├── lib.rs           # 公共 API 入口 + crate 文档
+├── context.rs       # GpuContext: 设备/队列/管线缓存
+├── buffer.rs        # GpuBuffer: CPU↔GPU 数据传输
+├── buffer_pool.rs   # BufferPool: 缓冲区复用池
+├── pipeline.rs      # ComputePipeline: 计算管线
+├── batch.rs         # GpuBatchSubmitter: 异步批量提交
+├── error.rs         # GpuError: 统一错误类型
+└── tasks/
+    ├── sha256.rs    # SHA-256 并行哈希
+    ├── phasher.rs   # 感知哈希统一入口
+    ├── bktree.rs    # BK-tree 近似搜索
+    └── *.wgsl       # WGSL 着色器
+```
+
+## 构建 & 测试
 
 ```bash
-cargo run --example demo
+# 构建
+cargo build
+cargo build --features image
+
+# 测试
+cargo test --features image
+
+# 基准测试
+cargo bench --features image
+
+# 代码检查
+cargo clippy --features image
 ```
 
-## 性能
+## 支持的后端
 
-测试平台：Windows (wgpu Vulkan 后端)
+| 后端 | 平台 |
+|------|------|
+| Vulkan | Windows / Linux |
+| Metal | macOS / iOS |
+| DX12 | Windows |
+| WebGPU | Web |
 
-### SHA-256 单 block 消息（32 字节）
-
-| 消息数量 | GPU（同步） | GPU（异步批量） | CPU（单线程） |
-|---------|-----------|---------------|-------------|
-| 1 条 | 1.6ms | - | 52ns |
-| 1000 条 | 1.8ms | - | 52µs |
-| 10000 条 | 3.5ms | - | 523µs |
-
-### 异步批量提交加速比
-
-| 场景 | 同步 compute | 异步 batch | 加速比 |
-|------|------------|-----------|--------|
-| 10 次单条消息 | 16.4ms | **3.8ms** | **4.3x** |
-| 100 次单条消息 | 164.4ms | **26.2ms** | **6.3x** |
-| 10 次 100 条批量 | 17.3ms | **3.9ms** | **4.4x** |
-
-> 注：GPU 在单条消息场景下慢于 CPU（调度开销 ~1.6ms），但在大批量或异步批量场景下具备实用价值。
-
-## 运行基准测试
-
-```bash
-cargo bench
-```
-
-基准测试报告将生成在 `target/criterion/` 目录下。
-
-## 项目结构
-
-```
-.
-├── src/
-│   ├── lib.rs           # 库入口与公共 API 导出
-│   ├── context.rs       # GpuContext：设备、队列、管线缓存
-│   ├── buffer.rs        # GpuBuffer：CPU-GPU 数据传输
-│   ├── buffer_pool.rs   # BufferPool：缓冲区复用
-│   ├── pipeline.rs      # ComputePipeline：计算管线与调度
-│   ├── batch.rs         # GpuBatchSubmitter：异步批量提交
-│   ├── error.rs         # GpuError：统一错误类型
-│   └── tasks/           # 业务层算法实现
-│       ├── sha256.rs    # SHA-256 GPU 并行哈希
-│       ├── sha256.wgsl  # SHA-256 计算着色器
-│       └── ...          # 其他算法
-├── tests/               # 集成测试
-├── benches/             # 性能基准测试
-├── examples/            # 使用示例
-└── openspec/            # 设计文档与变更管理
-```
-
-## 已实现的算法
-
-- [x] SHA-256 并行哈希（单 block 批量 + 多 block 链式）
-- [ ] 更多算法待扩展...
-
-## 许可证
+## License
 
 MIT

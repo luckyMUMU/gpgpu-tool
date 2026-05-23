@@ -15,6 +15,7 @@ benches/
 ├── block_hash_bench.rs      # Block hash benchmark
 ├── vert_gradient_hash_bench.rs  # Vertical gradient
 ├── double_gradient_hash_bench.rs # Double gradient
+├── large_scale_bench.rs      # Large-scale benchmarks (10K-100K images)
 ├── common.rs                # Shared benchmark utilities
 ├── common/                  # Additional shared code
 ├── performance_report.md    # Performance analysis

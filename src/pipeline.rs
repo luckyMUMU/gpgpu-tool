@@ -1,9 +1,28 @@
-use wgpu::{BindGroupLayout, ComputePipeline as WgpuComputePipeline, Device, Queue};
-use wgpu::CommandEncoder;
+use wgpu::{
+    BindGroupLayout, CommandEncoder, ComputePipeline as WgpuComputePipeline, Device, Queue,
+};
 
 use crate::buffer::GpuBuffer;
 use crate::error::GpuError;
 
+/// 计算管线，封装 WGSL 着色器的编译、绑定组创建和 dispatch 调度。
+///
+/// wgpu-compute-engine 内部使用 `PipelineCache` 实现着色器级缓存，
+/// 同一 WGSL 源码 + workgroup size 组合只编译一次。
+///
+/// # 使用方式
+///
+/// 通常不直接构造，而是通过 `GpuContext::get_or_create_pipeline()` 获取缓存实例：
+///
+/// ```no_run
+/// use wgpu_compute_engine::{GpuContext, GpuBuffer, BufferUsage};
+///
+/// let mut ctx = GpuContext::new_sync().unwrap();
+/// let pipeline = ctx.get_or_create_pipeline(
+///     include_str!("path/to/shader.wgsl"),
+///     [256, 1, 1],
+/// ).unwrap();
+/// ```
 pub struct ComputePipeline {
     pipeline: WgpuComputePipeline,
     bind_group_layout: BindGroupLayout,
@@ -11,6 +30,10 @@ pub struct ComputePipeline {
 }
 
 impl ComputePipeline {
+    /// 从 WGSL 源码编译计算管线。
+    ///
+    /// `workgroup_size` 指定着色器 `@workgroup_size(x, y, z)` 参数，
+    /// 用于计算 dispatch 时的 workgroup 数量。
     pub fn create(
         device: &Device,
         wgsl_source: &str,
@@ -112,6 +135,10 @@ impl ComputePipeline {
         })
     }
 
+    /// 执行一次 GPU dispatch，内部创建 encoder、绑定资源和提交。
+    ///
+    /// 适用于独立调用的场景。对于批量提交场景使用
+    /// [`encode_dispatch_into`](ComputePipeline::encode_dispatch_into)。
     pub fn dispatch(
         &self,
         device: &Device,
@@ -140,6 +167,7 @@ impl ComputePipeline {
         queue.submit(std::iter::once(encoder.finish()));
     }
 
+    #[doc(hidden)]
     pub fn encode_dispatch_into(
         &self,
         device: &Device,
@@ -162,6 +190,7 @@ impl ComputePipeline {
         }
     }
 
+    /// 返回此管线的 workgroup 尺寸。
     pub fn workgroup_size(&self) -> [u32; 3] {
         self.workgroup_size
     }

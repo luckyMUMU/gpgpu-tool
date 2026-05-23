@@ -1,7 +1,13 @@
 [package]
 name = "wgpu-compute-engine"
 version = "0.1.0"
+description = "跨平台 GPU 并行加速引擎，基于 wgpu。提供 SHA-256、感知哈希、BK-tree 相似度搜索等开箱即用的 GPU 计算能力。"
 edition = "2021"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/solo-king/wgpu-tool"
+keywords = ["gpu", "compute", "wgpu", "parallel", "hashing"]
+categories = ["science::gpu", "algorithms::data-processing"]
 
 [dependencies]
 wgpu = "24"
@@ -23,6 +29,9 @@ env_logger = "0.11"
 hex = "0.4"
 chrono = "0.4"
 image = "0.25"
+
+[package.metadata.docs.rs]
+features = ["image"]
 
 [[bench]]
 name = "sha256_bench"

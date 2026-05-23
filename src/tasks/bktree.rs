@@ -1,3 +1,17 @@
+/// 计算两个 64 位哈希值之间的汉明距离。
+///
+/// 汉明距离定义为对应位不同的数量，即 `(a ^ b).count_ones()`。
+/// 用于 BK-tree 中的相似度度量。
+///
+/// # 示例
+///
+/// ```
+/// use wgpu_compute_engine::tasks::bktree::hamming_distance;
+///
+/// assert_eq!(hamming_distance(0, 0), 0);
+/// assert_eq!(hamming_distance(0xFFFFFFFFFFFFFFFF, 0), 64);
+/// assert_eq!(hamming_distance(0b1010, 0b0101), 4);
+/// ```
 pub fn hamming_distance(a: u64, b: u64) -> u32 {
     (a ^ b).count_ones()
 }
@@ -54,16 +68,43 @@ impl BkNode {
     }
 }
 
+/// BK-tree（Burkhard-Keller Tree）数据结构，用于基于汉明距离的近似最近邻搜索。
+///
+/// # 原理
+///
+/// BK-tree 是一种度量树，利用三角不等式剪枝搜索空间。
+/// 插入时每个节点按照与父节点的汉明距离分叉；搜索时只遍历距离范围内的子树。
+///
+/// 对 N 条记录，搜索复杂度为 O(log N)，远优于暴力搜索的 O(N)。
+///
+/// # 使用示例
+///
+/// ```no_run
+/// use wgpu_compute_engine::tasks::bktree::BkTree;
+///
+/// let hashes = vec![0xA1B2C3D4, 0x12345678, 0x87654321, 0xA1B2C3D5];
+/// let tree = BkTree::from_hashes(hashes.iter().copied());
+///
+/// // 查找汉明距离 ≤ 5 的近似哈希
+/// let similar = tree.find(0xA1B2C3D4, 5);
+///
+/// // 查找最近邻
+/// if let Some((nearest, dist)) = tree.find_nearest(0xA1B2C3D4) {
+///     println!("最近邻: {:016x}, 距离: {}", nearest, dist);
+/// }
+/// ```
 pub struct BkTree {
     root: Option<BkNode>,
     len: usize,
 }
 
 impl BkTree {
+    /// 创建空的 BK-tree。
     pub fn new() -> Self {
         Self { root: None, len: 0 }
     }
 
+    /// 从迭代器批量构建 BK-tree，等价于依次调用 [`insert`](BkTree::insert)。
     pub fn from_hashes(hashes: impl IntoIterator<Item = u64>) -> Self {
         let mut tree = Self::new();
         for hash in hashes {
@@ -72,6 +113,7 @@ impl BkTree {
         tree
     }
 
+    /// 插入一个哈希值到树中。
     pub fn insert(&mut self, hash: u64) {
         self.len += 1;
         match &mut self.root {
@@ -87,6 +129,9 @@ impl BkTree {
         }
     }
 
+    /// 查找与 `hash` 的汉明距离 ≤ `threshold` 的所有哈希及其距离。
+    ///
+    /// 返回 `Vec<(hash, distance)>`，按距离升序排列。
     pub fn find(&self, hash: u64, threshold: u32) -> Vec<(u64, u32)> {
         let mut results = Vec::new();
         if let Some(root) = &self.root {
@@ -95,6 +140,9 @@ impl BkTree {
         results
     }
 
+    /// 查找树中与 `hash` 最近邻的哈希及其距离。
+    ///
+    /// 树为空时返回 `None`。
     pub fn find_nearest(&self, hash: u64) -> Option<(u64, u32)> {
         let mut best: Option<(u64, u32)> = None;
         if let Some(root) = &self.root {
@@ -103,10 +151,12 @@ impl BkTree {
         best
     }
 
+    /// 返回树中的元素数量。
     pub fn len(&self) -> usize {
         self.len
     }
 
+    /// 树是否为空。
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }

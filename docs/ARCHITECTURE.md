@@ -1,6 +1,6 @@
 # wgpu-compute-engine 技术架构文档
 
-> **版本**: 0.1.0 | **Rust Edition**: 2021 | **wgpu**: v24 | **生成日期**: 2026-05-20
+> **版本**: 0.1.0 | **Rust Edition**: 2021 | **wgpu**: v24 | **生成日期**: 2026-05-22
 
 ---
 
@@ -16,6 +16,8 @@ wgpu-compute-engine 是一个基于 wgpu 的跨平台 GPU 通用计算引擎，�
 | **管线缓存** | 基于 fxhash 的着色器编译缓存，避免重复编译 |
 | **缓冲区池化** | 按 2 的幂次分档复用 GPU 缓冲区，减少分配开销 |
 | **异步批量提交** | 将多次 CPU-GPU 同步合并为一次 queue.submit()，4-6x 加速 |
+| **零拷贝流水线** | GPU 缩放→哈希直通，无需 CPU 中间缓存 |
+| **BK-tree 近似搜索** | O(log N) 汉明距离最近邻搜索 |
 | **算法可扩展** | 新算法只需实现 `.rs` + `.wgsl` 配对，复用能力层基础设施 |
 
 ### 1.2 技术栈
@@ -26,7 +28,7 @@ pollster v0.4     → async → sync 桥接
 bytemuck v1       → 零开销类型转换（Pod/Zeroable）
 thiserror v2      → 错误类型派生
 log v0.4          → 结构化日志
-image v0.25       → 可选：图像加载与 Lanczos3 缩放（feature-gated）
+image v0.25       → 可选：图像加载与缩放（feature-gated）
 ```
 
 ---
@@ -34,39 +36,41 @@ image v0.25       → 可选：图像加载与 Lanczos3 缩放（feature-gated�
 ## 2. 架构总览
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    业务层 (Business)                      │
-│                                                         │
-│  ┌──────────────┐  ┌──────────────────────────────────┐ │
-│  │ Sha256Computer│  │        PerceptualHasher         │ │
-│  │ (SHA-256 哈希)│  │  ┌─────┐ ┌──────┐ ┌──────────┐ │ │
-│  │ + BatchSubmit │  │  │Mean │ │Median│ │Gradient  │ │ │
-│  └──────┬───────┘  │  └─────┘ └──────┘ └──────────┘ │ │
-│         │          │  + hash_common (trait + macros)  │ │
-│         │          └───────────────┬──────────────────┘ │
-└─────────┼──────────────────────────┼───────────────────┘
-          │                          │
-┌─────────┼──────────────────────────┼───────────────────┐
-│         ▼                          ▼                   │
-│              能力层 (Capability Layer)                   │
-│                                                         │
-│  ┌────────────┐  ┌──────────┐  ┌──────────────────┐    │
-│  │ GpuContext │  │GpuBuffer │  │  ComputePipeline  │    │
-│  │ ·device    │  │ ·upload  │  │  ·shader compile  │    │
-│  │ ·queue     │  │ ·download│  │  ·bind group      │    │
-│  │ ·pipeline  │  │ ·write   │  │  ·dispatch        │    │
-│  │   cache    │  └──────────┘  │  ·encode_dispatch │    │
-│  └────────────┘  ┌──────────┐  └──────────────────┘    │
-│  ┌────────────┐  │BufferPool│                           │
-│  │GpuBatch    │  │ ·acquire │                           │
-│  │Submitter   │  │ ·release │                           │
-│  │ ·submit    │  └──────────┘                           │
-│  │ ·wait_all  │                                         │
-│  └────────────┘  ┌──────────┐                           │
-│                  │ GpuError │                           │
-│                  │ (9 variants)                         │
-│                  └──────────┘                           │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                         业务层 (Business)                          │
+│                                                                  │
+│  ┌──────────────┐  ┌──────────────────┐  ┌────────────────────┐ │
+│  │ Sha256Computer│  │ PerceptualHasher │  │      BkTree        │ │
+│  │ (SHA-256 哈希)│  │ ┌─────┐┌──────┐ │  │ (BK-tree 最近邻)    │ │
+│  │ + BatchSubmit │  │ │Mean ││Median│ │  │ + hamming_distance │ │
+│  └──────┬───────┘  │ └─────┘└──────┘ │  └────────────────────┘ │
+│         │          │ + gpu_resize     │                          │
+│         │          │ (零拷贝缩放流水线) │                          │
+│         │          └────────┬─────────┘                          │
+│         │                   │                                    │
+│         │    hash_common: PerceptualHashComputer trait + macros  │
+└─────────┼───────────────────┼────────────────────────────────────┘
+          │                   │
+┌─────────┼───────────────────┼────────────────────────────────────┐
+│         ▼                   ▼                                    │
+│                     能力层 (Capability Layer)                      │
+│                                                                  │
+│  ┌────────────┐  ┌──────────┐  ┌──────────────────┐              │
+│  │ GpuContext │  │GpuBuffer │  │  ComputePipeline  │              │
+│  │ ·device    │  │ ·upload  │  │  ·shader compile  │              │
+│  │ ·queue     │  │ ·download│  │  ·bind group      │              │
+│  │ ·pipeline  │  │ ·write   │  │  ·dispatch        │              │
+│  │   cache    │  └──────────┘  └──────────────────┘              │
+│  └────────────┘  ┌──────────┐                                    │
+│  ┌────────────┐  │BufferPool│                                    │
+│  │GpuBatch    │  │ ·acquire │                                    │
+│  │Submitter   │  │ ·release │                                    │
+│  │ ·submit    │  └──────────┘                                    │
+│  │ ·wait_all  │  ┌──────────┐                                    │
+│  └────────────┘  │ GpuError │                                    │
+│                  │ (9 variants)                                   │
+│                  └──────────┘                                    │
+└──────────────────────────────────────────────────────────────────┘
                           │
                           ▼
               ┌───────────────────────┐
@@ -80,7 +84,7 @@ image v0.25       → 可选：图像加载与 Lanczos3 缩放（feature-gated�
 | 层级 | 职责 | 模块 |
 |------|------|------|
 | **能力层** | wgpu 封装：设备管理、缓冲区传输、管线编译与缓存、批量提交 | `context`, `buffer`, `buffer_pool`, `pipeline`, `batch`, `error` |
-| **业务层** | 算法实现：SHA-256 并行哈希、6 种感知图像哈希 | `tasks/sha256`, `tasks/phasher`, `tasks/hash_common`, `tasks/*_hash` |
+| **业务层** | 算法实现：SHA-256、感知哈希（6 种）、BK-tree 近似搜索、GPU 缩放 | `tasks/sha256`, `tasks/phasher`, `tasks/bktree`, `tasks/gpu_resize`, `tasks/hash_common` |
 
 ---
 
@@ -136,7 +140,7 @@ fn fxhash(s: &str) -> u64 {
 
 ### 3.2 GpuBuffer — GPU 缓冲区
 
-**文件**: `src/buffer.rs` (127 行)
+**文件**: `src/buffer.rs` (197 行)
 
 **职责**: 封装 wgpu Buffer，提供 CPU-GPU 双向数据传输。
 
@@ -154,7 +158,7 @@ GpuBuffer
 | `from_data<T: Pod>(device, data, usage)` | 从类型化 CPU 数据创建 |
 | `from_bytes(device, data, usage)` | 从原始字节创建 |
 | `empty(device, size, usage)` | 创建空缓冲区（用于输出） |
-| `from_raw(buffer, size)` | 从原始 wgpu Buffer 创建（BufferPool 复用） |
+| `from_raw(buffer, size)` | 从原始 wgpu Buffer 创建（BufferPool / 内部使用） |
 
 **数据传输**:
 
@@ -163,8 +167,7 @@ GpuBuffer
 | `write<T>(queue, offset, data)` | CPU → GPU | 类型化写入 |
 | `write_bytes(queue, offset, data)` | CPU → GPU | 原始字节写入 |
 | `download(device, queue)` | GPU → CPU | staging buffer + map_async 同步下载 |
-
-**RAII 生命周期**: `GpuBuffer` 持有 `Buffer`，Drop 时自动释放。通过 `into_raw()` / `from_raw()` 实现与 BufferPool 的无缝交接。
+| `download_with_pool(device, queue, pool)` | GPU → CPU | 使用 BufferPool 暂存池下载 |
 
 **BufferUsage 枚举**:
 - `Storage`: 可读写存储缓冲区 → `STORAGE | COPY_DST`
@@ -172,15 +175,16 @@ GpuBuffer
 
 ### 3.3 BufferPool — 缓冲区池
 
-**文件**: `src/buffer_pool.rs` (139 行)
+**文件**: `src/buffer_pool.rs` (168 行)
 
 **职责**: 按尺寸分档复用 GPU 缓冲区，减少重复分配开销。
 
 **核心结构**:
 ```
 BufferPool
-├── pools: RefCell<HashMap<u64, Vec<Buffer>>>  # 按档位分组的空闲缓冲区
-└── max_per_class: usize = 8                    # 每档最大缓存数
+├── pools: RefCell<HashMap<PoolKey, Vec<Buffer>>>  # 按(档位,用途)分组
+├── staging_pools: RefCell<HashMap<u64, Vec<Buffer>>> # 暂存池（MAP_READ）
+└── max_per_class: usize = 8                        # 每档最大缓存数
 ```
 
 **分档策略 (size_class)**:
@@ -197,23 +201,24 @@ BufferPool
 
 **获取流程 (acquire)**:
 1. 计算请求尺寸对应的档位
-2. 尝试从该档位获取空闲 Buffer
-3. 若无，尝试从大一档获取（只查一级，避免过度浪费）
-4. 若仍无，创建新 Buffer（按档位大小分配）
+2. 尝试从 `(档位, usage)` 组合获取空闲 Buffer
+3. 若无，创建新 Buffer（按档位大小分配）
 
 **归还流程 (release)**:
 1. 计算 Buffer 的档位
 2. 若该档未满（< max_per_class），放入空闲队列
 3. 否则丢弃（由 wgpu 回收）
+4. 大于 1MB 的缓冲区直接销毁，避免占用显存
 
 **设计原则**:
-- 只复用 Storage/Uniform 用途，不缓存 staging buffer（需 MAP_READ）
+- 使用 `PoolKey { size_class, usage }` 结构体作为 HashMap 键，区分 Storage/Uniform 用途
+- 独立 `staging_pools` 管理 MAP_READ 暂存缓冲区的复用
 - `RefCell` 实现内部可变性，`acquire`/`release` 无需 `&mut self`
 - 缓冲区从池中取出后归调用者所有
 
 ### 3.4 ComputePipeline — 计算管线
 
-**文件**: `src/pipeline.rs` (201 行)
+**文件**: `src/pipeline.rs` (197 行)
 
 **职责**: 封装 wgpu ComputePipeline，负责 shader 编译、bind group 构建和 dispatch 执行。
 
@@ -239,9 +244,6 @@ ComputePipeline
 |------|------|----------|
 | `dispatch()` | 创建 encoder → 编码 → 提交 queue | 单次同步执行 |
 | `encode_dispatch_into()` | 编码到已有 encoder，不提交 | 批量提交场景 |
-| `encode_dispatch()` (private) | 编码到新 encoder，返回 encoder | 内部使用 |
-
-**关键设计**: 提供 `encode_dispatch_into` 使业务层能将多个 dispatch 编码到同一个 CommandEncoder，实现真正的批量提交。
 
 ### 3.5 GpuBatchSubmitter — 异步批量提交器
 
@@ -354,47 +356,24 @@ Sha256Computer
 → 最后一个 block 的结果即为最终哈希
 ```
 
-**参数缓存**:
-- Single block: 按 `message_count` 缓存 params buffer（HashMap）
-- Multi block: 固定参数，只创建一次（Option）
-
 **Sha256BatchSubmitter** (内部):
 - `submit(messages)` → 分类单/多 block → 编码到共享 encoder
 - `wait_all()` → 一次提交 → 统一读取结果
-- 多 block 消息由于数据依赖，中间 block 需同步等待
-
-**WGSL Shader 结构** (`sha256.wgsl`):
-```wgsl
-@group(0) @binding(0) var<storage, read> messages: array<u32>;
-@group(0) @binding(1) var<storage, read_write> hashes: array<u32>;
-@group(0) @binding(2) var<uniform> params: vec4<u32>;
-
-// SHA-256 常量: 64 个 K 值
-const K: array<u32, 64> = ...;
-
-// 辅助函数: ch, maj, big_sigma0, big_sigma1, small_sigma0, small_sigma1
-// 每个 workgroup 处理一条消息
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    // block_mode == 0: INIT 模式（messages 直接包含 block 数据）
-    // block_mode == 1: UPDATE 模式（messages 前 8 u32 为中间哈希）
-    // 完整的 SHA-256 64 轮压缩
-}
-```
 
 ### 4.2 PerceptualHasher — 感知图像哈希
 
 **文件**: `src/tasks/phasher.rs` (197 行)
 
-**职责**: 统一的感知图像哈希入口，支持 6 种算法。
+**职责**: 统一的感知图像哈希入口，支持 6 种算法 + GPU 加速缩放。
 
 **核心结构**:
 ```
 PerceptualHasher
-├── algorithm: HashAlgorithm          # 算法类型
-├── target_width: u32                 # 目标宽度
-├── target_height: u32                # 目标高度
-└── computer: Box<dyn PerceptualHashComputer> # 多态计算器
+├── algorithm: HashAlgorithm              # 算法类型
+├── target_width: u32                     # 目标宽度
+├── target_height: u32                    # 目标高度
+├── computer: Box<dyn PerceptualHashComputer> # 多态计算器
+└── gpu_resize: Option<GpuResize>         # GPU 缩放器（可启用）
 ```
 
 **支持的算法**:
@@ -408,17 +387,24 @@ PerceptualHasher
 | VertGradient | 9×8 | 垂直边缘敏感 |
 | DoubleGradient | 9×9 | 双向边缘敏感 |
 
-**工作流程**:
+**工作流程** (默认 CPU 缩放路径):
 ```
 输入图像 (任意尺寸灰度像素)
 → resize_grayscale() (CPU 盒式滤波下采样)
 → computer.compute() (GPU 计算哈希)
-→ 返回 u64 哈希值
+→ 返回 Vec<u64> 哈希值
 ```
 
-**图像缩放**:
-- CPU 侧: `resize_grayscale()` — 盒式滤波下采样（零依赖）
-- GPU 侧 (image feature): `compute_images()` — Lanczos3 高质量缩放
+**零拷贝 GPU 缩放流程** (`with_resize_mode(true)`):
+```
+输入图像 (任意尺寸灰度像素)
+→ gpu_resize.resize_batch_gpu() (GPU box filter 缩放, 结果留在显存)
+→ compute_phash_from_gpu_buffer() (直接使用 GPU buffer 计算哈希, 无 CPU 中转)
+→ 返回 Vec<u64> 哈希值
+```
+
+**分批处理**: 当单批数据超出 GPU 缓冲区大小限制时，自动拆分为多个子批次，
+每个子批次独立完成 GPU 零拷贝流水线，合并结果。
 
 ### 4.3 hash_common — 感知哈希共享基础设施
 
@@ -439,11 +425,13 @@ pub struct PhashParams {
 }
 ```
 
-2. **PerceptualHashComputer trait** — 统一接口
+2. **PerceptualHashComputer trait** — 统一接口（新增零拷贝支持）
 ```rust
 pub trait PerceptualHashComputer {
     fn compute(&self, ctx: &GpuContext, images: &[Vec<u8>])
         -> Result<Vec<u64>, GpuError>;
+    fn pipeline(&self) -> &Arc<ComputePipeline>;        // 零拷贝需要
+    fn workgroup_size(&self) -> [u32; 3];               // 零拷贝需要
 }
 ```
 
@@ -452,13 +440,13 @@ pub trait PerceptualHashComputer {
 像素打包 → GpuBuffer 创建 → dispatch → 下载 → 解析 u64
 ```
 
-4. **宏系统** — 消除 6 个算法的重复代码:
+4. **compute_phash_from_gpu_buffer()** — 零拷贝入口
+```
+接收 GPU buffer → 创建输出 buffer → dispatch → 下载 → 解析 u64
+(输入数据已在 GPU 显存中，无需 CPU 中转)
+```
 
-| 宏 | 作用 |
-|----|------|
-| `declare_phash_computer!` | 生成结构体 + new/with_workgroup_size 构造函数 |
-| `impl_phash_computer_simple!` | 生成 PerceptualHashComputer 实现（正方形尺寸推断） |
-| `impl_phash_computer_custom_dims!` | 生成 PerceptualHashComputer 实现（自定义宽高推断） |
+5. **宏系统** — 消除 6 个算法的重复代码
 
 ### 4.4 算法模块 — 薄封装模式
 
@@ -477,11 +465,85 @@ declare_phash_computer!(
 impl_phash_computer_simple!(MeanHashComputer);
 ```
 
-**已实现的算法**:
+### 4.5 GpuResize — GPU 图像缩放
+
+**文件**: `src/tasks/gpu_resize.rs` + `src/tasks/resize.wgsl`
+
+**职责**: 使用 GPU compute shader 进行图像 box filter 缩放，支持零拷贝流水线。
+
+**核心结构**:
+```
+GpuResize
+├── pipeline: Arc<ComputePipeline>  # 缩放管线
+├── workgroup_size: [u32; 3]       # 工作组大小
+└── buffer_pool: BufferPool         # 缓冲区复用
+```
+
+**批量和零拷贝**:
+- `resize_batch()`: 批量缩放 + 返回 CPU Vec<u8>（回退路径）
+- `resize_batch_gpu()`: 批量缩放 + 返回 GpuBuffer（零拷贝路径）
+
+**WGSL Shader** (`resize.wgsl`):
+```wgsl
+@group(0) @binding(0) var<storage, read> src_pixels: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst_pixels: array<u32>;
+@group(0) @binding(2) var<uniform> params: vec4<u32>;
+
+// Box filter: 每个 work item 处理一张完整图像
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    // 计算源像素区域
+    // 对目标区域内每个像素，求源区域对应块的像素平均值
+}
+```
+
+**分批策略**: 根据图像数量、输入输出尺寸计算单批是否超过 `256MB` 缓冲区限制，
+超限时自动分批。
+
+### 4.6 BkTree — BK-tree 近似最近邻搜索
+
+**文件**: `src/tasks/bktree.rs` (120 行)
+
+**职责**: 基于汉明距离（Hamming Distance）的度量树，
+为感知哈希提供 O(log N) 近似最近邻搜索。
+
+**核心结构**:
+```
+BkTree
+├── root: Option<BkNode>  # 根节点
+└── len: usize            # 元素数量
+```
+
+**核心算法**:
+
+| 操作 | 复杂度 | 说明 |
+|------|--------|------|
+| `insert(hash)` | O(log N) | 按汉明距离插入子树 |
+| `find(hash, threshold)` | O(log N) | 三角不等式剪枝 |
+| `find_nearest(hash)` | O(log N) | 自适应剪枝搜索 |
+
+**性能数据** (10 万条哈希):
+
+| 操作 | BK-tree | 暴力搜索 | 加速比 |
+|------|---------|---------|--------|
+| 查找最近邻 | ~50ns | ~312µs | **~6240x** |
+| 阈值搜索 (threshold=5) | ~150ns | ~312µs | **~2080x** |
+| 构建 | ~97ms | — | — |
+
+**使用场景**: 结合 `PerceptualHasher` 的输出，实现近似图像检索：
+```
+感知哈希 → BK-tree 索引 → 阈值搜索返回相似图像
+```
+
+### 4.7 算法一览
 
 | 文件 | WGSL | 行数 | 说明 |
 |------|------|------|------|
 | `sha256.rs` | `sha256.wgsl` | 654 + 124 | SHA-256 并行哈希（参考实现） |
+| `phasher.rs` | — | ~200 | 感知哈希编排器 + GPU 缩放集成 |
+| `hash_common.rs` | — | ~200 | 共享 trait + 宏 + 零拷贝入口 |
+| `gpu_resize.rs` | `resize.wgsl` | ~250 | GPU box filter 缩放 |
+| `bktree.rs` | — | ~120 | BK-tree 近似搜索 |
 | `mean_hash.rs` | `mean_hash.wgsl` | 14 + ~40 | 均值哈希 |
 | `median_hash.rs` | `median_hash.wgsl` | 14 + ~40 | 中值哈希 |
 | `gradient_hash.rs` | `gradient_hash.wgsl` | 14 + ~40 | 梯度哈希 |
@@ -515,24 +577,47 @@ impl_phash_computer_simple!(MeanHashComputer);
     └── 合并结果 → Vec<[u8; 32]>
 ```
 
-### 5.2 异步批量提交流程
+### 5.2 零拷贝感知哈希流水线
 
 ```
-用户创建 Sha256BatchSubmitter
+PerceptualHasher::compute()  (gpu_resize 启用时)
     │
-    ├── submit(messages_1) → 编码到 encoder (不提交)
-    ├── submit(messages_2) → 继续编码到同一 encoder
-    ├── submit(messages_3) → 继续编码到同一 encoder
+    ├── 计算分批：根据缓冲区限制拆分子批次
+    │
+    └── 每个子批次:
+        ├── memcpy 打包输入数据到 u32 数组
+        ├── BufferPool.acquire() → input_buffer
+        ├── queue.write_buffer() → 上传到 GPU
+        ├── GpuResize 管线 dispatch → 缩放结果留在 output_buffer
+        ├── BufferPool.release(input_buffer)
+        │
+        ├── compute_phash_from_gpu_buffer():
+        │   ├── BufferPool.acquire() → hash_output_buffer
+        │   ├── hash 管线 dispatch → 哈希结果写入 hash_output_buffer
+        │   ├── hash_output_buffer.download() → 读取 u64 哈希
+        │   └── 释放缓冲区
+        │
+        └── 合并子批次结果 → Vec<u64>
+```
+
+### 5.3 异步批量提交流程
+
+```
+用户创建 GpuBatchSubmitter
+    │
+    ├── submit(job_1) → 编码到 encoder (不提交)
+    ├── submit(job_2) → 继续编码到同一 encoder
+    ├── submit(job_3) → 继续编码到同一 encoder
     │
     └── wait_all()
         ├── queue.submit(encoder.finish()) → 一次提交
         ├── device.poll(Wait) → 等待 GPU 完成
         ├── 逐个 map_async → 读取 staging buffer
-        ├── 解析结果 → Vec<(usize, [u8; 32])>
+        ├── 解析结果
         └── BufferPool.release() → 归还缓冲区
 ```
 
-### 5.3 管线缓存流程
+### 5.4 管线缓存流程
 
 ```
 业务层调用 ctx.get_or_create_pipeline(wgsl, workgroup_size)
@@ -557,16 +642,18 @@ impl_phash_computer_simple!(MeanHashComputer);
 ```
 lib.rs
 ├── batch          → buffer, error, pipeline, context
-├── buffer         → error
+├── buffer         → error, buffer_pool
 ├── buffer_pool    → buffer
 ├── context        → error, pipeline
 ├── error          → (无依赖)
 ├── pipeline       → buffer, error
 └── tasks
-    ├── mod.rs     → (导出所有子模块)
+    ├── mod.rs     → (导出子模块)
     ├── sha256     → buffer, buffer_pool, context, error, pipeline
-    ├── phasher    → context, error, hash_common, all hash algorithms
+    ├── phasher    → context, error, hash_common, hash_algorithms, gpu_resize
     ├── hash_common → buffer, context, error, pipeline
+    ├── gpu_resize → buffer, buffer_pool, context, error, pipeline
+    ├── bktree     → (无依赖, 纯算法)
     ├── mean_hash  → hash_common (macros)
     ├── median_hash → hash_common (macros)
     ├── gradient_hash → hash_common (macros)
@@ -632,23 +719,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 ### 8.1 构建命令
 
 ```bash
-cargo build                    # 默认构建（无 image feature）
-cargo build --features image   # 启用图像支持
-cargo build --release          # 发布构建
+cargo build                         # 默认构建（无 image feature）
+cargo build --features image        # 启用图像支持
+cargo build --release               # 发布构建
 ```
 
 ### 8.2 测试
 
 ```bash
-cargo test                     # 运行所有集成测试
-cargo test sha256              # 运行特定测试
+cargo test                          # 运行所有测试
+cargo test sha256                   # 运行特定测试
+cargo test --test gpu_resize_test   # 运行 GPU 缩放测试
+cargo test --test bktree_test       # 运行 BK-tree 测试
 ```
 
 ### 8.3 基准测试
 
 ```bash
-cargo bench                    # 运行所有基准测试
-cargo bench --bench sha256_bench  # 运行特定基准
+cargo bench                         # 运行所有基准测试
+cargo bench --bench sha256_bench    # 运行特定基准
+cargo bench --bench large_scale_bench --features image  # 大型图像基准
 ```
 
 基准测试报告生成在 `target/criterion/`。
@@ -656,13 +746,13 @@ cargo bench --bench sha256_bench  # 运行特定基准
 ### 8.4 示例运行
 
 ```bash
-cargo run --example demo       # 运行演示
+cargo run --example demo            # 运行演示
 ```
 
 ### 8.5 代码检查
 
 ```bash
-cargo clippy                   # lint 检查
+cargo clippy                        # lint 检查
 ```
 
 ---
@@ -679,6 +769,8 @@ cargo clippy                   # lint 检查
 | 感知哈希宏 | 声明式宏 | 6 个算法仅 84 行代码，消除重复 |
 | 非泛型 GpuBuffer | bytemuck 转换 | 避免单态化膨胀，运行时类型安全 |
 | Pipeline 使用 Arc | 引用计数共享 | 业务层可持有管线引用，无需 borrow |
+| GPU 缩放输出格式 | 1 u32/像素 | 匹配 hash shader 输入格式，零拷贝直通 |
+| 分批策略 | 调用方分批 | phasher 层控制，gpu_resize 只负责单批 |
 
 ---
 
@@ -689,9 +781,10 @@ cargo clippy                   # lint 检查
 | GPU 调度开销 | 单次 dispatch 约 1.6ms，小批量场景不如 CPU |
 | Multi-block 数据依赖 | SHA-256 多 block 消息无法完全并行，中间 block 需同步 |
 | 固定 Bind Group Layout | 所有算法共享 3-binding 布局，灵活性受限 |
-| 无动态 offset | Bind group 不支持 dynamic offset，大数组需单独 buffer |
 | image feature 可选 | 默认不启用图像支持，需显式开启 |
+| GPU 缩放质量 | box filter 适合下采样，上采样质量不如 Lanczos |
+| 分批粒度 | 分批依据 256MB 硬限制，未考虑实际显存容量 |
 
 ---
 
-*文档生成完毕。基于源码分析，覆盖能力层 6 个模块、业务层 9 个算法模块的完整架构。*
+*文档生成完毕。基于源码分析，覆盖能力层 6 个模块、业务层 10 个模块的完整架构。*

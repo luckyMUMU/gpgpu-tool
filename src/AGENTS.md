@@ -6,14 +6,16 @@ Capability layer: GPU context, buffer management, pipeline caching, batch submis
 
 ## WHERE TO LOOK
 
-| Component | File | Role |
-|-----------|------|------|
-| GPU context | `context.rs` | `GpuContext`: device/queue/pipeline cache, sync/async creation |
-| Buffer | `buffer.rs` | `GpuBuffer`: CPU-GPU data transfer, upload/download |
-| Buffer pool | `buffer_pool.rs` | `BufferPool`: size-tiered buffer reuse |
-| Pipeline | `pipeline.rs` | `ComputePipeline`: shader creation + dispatch |
-| Batch submit | `batch.rs` | `GpuBatchSubmitter`: async batch job pattern |
-| Error type | `error.rs` | `GpuError`: thiserror enum, 9 variants |
+| Component | File | Lines | Role | Dependencies |
+|-----------|------|-------|------|-------------|
+| Public API | `lib.rs` | ~130 | Crate root and documentation | (exports all modules) |
+| GPU context | `context.rs` | ~170 | `GpuContext`: device/queue/pipeline cache, sync/async creation | error, pipeline |
+| Buffer | `buffer.rs` | ~197 | `GpuBuffer`: CPU-GPU data transfer, upload/download | error, buffer_pool |
+| Buffer pool | `buffer_pool.rs` | ~168 | `BufferPool`: size-tiered buffer reuse | buffer |
+| Pipeline | `pipeline.rs` | ~197 | `ComputePipeline`: shader creation + dispatch | buffer, error |
+| Batch submit | `batch.rs` | ~174 | `GpuBatchSubmitter`: async batch job pattern | buffer, error, pipeline, context |
+| Error type | `error.rs` | ~32 | `GpuError`: thiserror enum, 9 variants | (none) |
+| Tasks | `tasks/` | — | Business-layer algorithms | buffer, context, pipeline |
 
 ## CONVENTIONS
 

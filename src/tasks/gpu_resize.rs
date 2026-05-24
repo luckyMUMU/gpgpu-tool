@@ -4,7 +4,7 @@ use crate::buffer::{BufferUsage, GpuBuffer};
 use crate::buffer_pool::{BufferPool, BufferPoolConfig};
 use crate::context::GpuContext;
 use crate::error::GpuError;
-use crate::pipeline::ComputePipeline;
+use crate::pipeline::{ComputePipeline, PipelineDescriptor};
 
 const RESIZE_WGSL: &str = include_str!("resize.wgsl");
 
@@ -80,7 +80,9 @@ impl GpuResize {
         ctx: &mut GpuContext,
         config: GpuResizeConfig,
     ) -> Result<Self, GpuError> {
-        let pipeline = ctx.get_or_create_pipeline(RESIZE_WGSL, config.workgroup_size)?;
+        let pipeline = ctx.get_or_create_pipeline(
+            &PipelineDescriptor::default_3_binding(RESIZE_WGSL, config.workgroup_size),
+        )?;
         Ok(Self {
             pipeline,
             workgroup_size: config.workgroup_size,
@@ -206,14 +208,9 @@ impl GpuResize {
         let src_pixels = (src_w * src_h) as usize;
         let dst_pixels = (target_width * target_height) as usize;
 
-        // u32-per-pixel: 每像素一个 u32，1/4 密度但消除 shader 中的除法/取模
-        let total_src_u32 = image_count * src_pixels;
-        let mut all_pixels: Vec<u32> = vec![0u32; total_src_u32];
-        for (img_idx, img) in images.iter().enumerate() {
-            let start = img_idx * src_pixels;
-            for (i, &pixel) in img.iter().enumerate() {
-                all_pixels[start + i] = pixel as u32;
-            }
+        let mut all_pixels: Vec<u32> = Vec::with_capacity(image_count * src_pixels);
+        for img in images {
+            all_pixels.extend(crate::pixel_pack::pack_u8_to_u32(img));
         }
 
         let input_size = (all_pixels.len() * 4) as u64;
@@ -246,9 +243,7 @@ impl GpuResize {
         self.pipeline.dispatch(
             device,
             queue,
-            &input_buffer,
-            &output_buffer,
-            &params_buffer,
+            &[&input_buffer, &output_buffer, &params_buffer],
             [dispatch_x, 1, 1],
         );
 
@@ -272,14 +267,9 @@ impl GpuResize {
         let src_pixels = (src_w * src_h) as usize;
         let dst_pixels = (target_width * target_height) as usize;
 
-        // u32-per-pixel
-        let total_src_u32 = image_count * src_pixels;
-        let mut all_pixels: Vec<u32> = vec![0u32; total_src_u32];
-        for (img_idx, img) in images.iter().enumerate() {
-            let start = img_idx * src_pixels;
-            for (i, &pixel) in img.iter().enumerate() {
-                all_pixels[start + i] = pixel as u32;
-            }
+        let mut all_pixels: Vec<u32> = Vec::with_capacity(image_count * src_pixels);
+        for img in images {
+            all_pixels.extend(crate::pixel_pack::pack_u8_to_u32(img));
         }
 
         let input_size = (all_pixels.len() * 4) as u64;
@@ -312,9 +302,7 @@ impl GpuResize {
         self.pipeline.dispatch(
             device,
             queue,
-            &input_buffer,
-            &output_buffer,
-            &params_buffer,
+            &[&input_buffer, &output_buffer, &params_buffer],
             [dispatch_x, 1, 1],
         );
 
@@ -326,11 +314,8 @@ impl GpuResize {
         let raw_u32 = bytemuck::cast_slice::<u8, u32>(&result);
         let mut resized_images = Vec::with_capacity(image_count);
         for i in 0..image_count {
-            let mut pixels = Vec::with_capacity(dst_pixels);
             let offset = i * dst_pixels;
-            for j in 0..dst_pixels {
-                pixels.push((raw_u32[offset + j] & 0xFF) as u8);
-            }
+            let pixels = crate::pixel_pack::unpack_u32_to_u8(&raw_u32[offset..offset + dst_pixels], dst_pixels);
             resized_images.push(pixels);
         }
 

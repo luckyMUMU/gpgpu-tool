@@ -159,11 +159,7 @@ pub fn compute_phash(
 
     let mut all_pixels: Vec<u32> = Vec::with_capacity(image_count * pixels_per_image);
     for img in images {
-        let start = all_pixels.len();
-        all_pixels.resize(start + img.len(), 0);
-        for (i, &pixel) in img.iter().enumerate() {
-            all_pixels[start + i] = pixel as u32;
-        }
+        all_pixels.extend(crate::pixel_pack::pack_u8_to_u32(img));
     }
 
     let input_size = (all_pixels.len() * 4) as u64;
@@ -189,7 +185,7 @@ pub fn compute_phash(
     let params_buffer = GpuBuffer::from_data(device, &[params], BufferUsage::Uniform);
 
     let dispatch_x = (image_count as u32).div_ceil(workgroup_size[0]).max(1);
-    pipeline.dispatch(device, queue, &input_buffer, &output_buffer, &params_buffer, [dispatch_x, 1, 1]);
+    pipeline.dispatch(device, queue, &[&input_buffer, &output_buffer, &params_buffer], [dispatch_x, 1, 1]);
 
     let result = output_buffer.download_with_pool(device, queue, buffer_pool)?;
     buffer_pool.release(input_buffer.into_raw(), BufferUsage::Storage);
@@ -249,7 +245,7 @@ pub fn compute_phash_from_gpu_buffer(
     let params_buffer = GpuBuffer::from_data(device, &[params], BufferUsage::Uniform);
 
     let dispatch_x = (image_count as u32).div_ceil(workgroup_size[0]).max(1);
-    pipeline.dispatch(device, queue, input_buffer, &output_buffer, &params_buffer, [dispatch_x, 1, 1]);
+    pipeline.dispatch(device, queue, &[input_buffer, &output_buffer, &params_buffer], [dispatch_x, 1, 1]);
     let result = output_buffer.download_with_pool(device, queue, buffer_pool)?;
     buffer_pool.release(output_buffer.into_raw(), BufferUsage::Storage);
 
@@ -302,7 +298,9 @@ macro_rules! declare_phash_computer {
                 workgroup_size: [u32; 3],
                 hash_size: $crate::tasks::hash_common::HashSize,
             ) -> Result<Self, $crate::error::GpuError> {
-                let pipeline = ctx.get_or_create_pipeline($wgsl, workgroup_size)?;
+                let pipeline = ctx.get_or_create_pipeline(
+                    &$crate::pipeline::PipelineDescriptor::default_3_binding($wgsl, workgroup_size),
+                )?;
                 Ok(Self {
                     pipeline: ::std::sync::Arc::clone(&pipeline),
                     workgroup_size,

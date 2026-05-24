@@ -29,4 +29,10 @@ pub enum GpuError {
 
     #[error("输入参数无效: {0}")]
     InvalidInput(String),
+
+    #[error("CPU 降级执行失败: {0}")]
+    CpuFallback(String),
+
+    #[error("GPU 计算超时 ({ms}ms)")]
+    Timeout { ms: u64 },
 }

@@ -3,12 +3,12 @@ use std::path::Path;
 use std::time::Instant;
 
 use image::GenericImageView;
-use wgpu_compute_engine::GpuContext;
-use wgpu_compute_engine::tasks::hash_common::PerceptualHashComputer;
-use wgpu_compute_engine::tasks::mean_hash::MeanHashComputer;
-use wgpu_compute_engine::tasks::median_hash::MedianHashComputer;
-use wgpu_compute_engine::tasks::gradient_hash::GradientHashComputer;
-use wgpu_compute_engine::tasks::sha256::Sha256Computer;
+use gpgpu_tool::GpuContext;
+use gpgpu_tool::tasks::hash_common::PerceptualHashComputer;
+use gpgpu_tool::tasks::mean_hash::MeanHashComputer;
+use gpgpu_tool::tasks::median_hash::MedianHashComputer;
+use gpgpu_tool::tasks::gradient_hash::GradientHashComputer;
+use gpgpu_tool::tasks::sha256::Sha256Computer;
 
 const DATA_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data");
 

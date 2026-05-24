@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use wgpu_compute_engine::{
+use gpgpu_tool::{
     tasks::hash_common::PerceptualHashComputer,
     tasks::vert_gradient_hash::VertGradientHashComputer,
     GpuContext,

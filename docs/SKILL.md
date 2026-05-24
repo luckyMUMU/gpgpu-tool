@@ -1,9 +1,9 @@
 ---
-name: "wgpu-compute-engine"
+name: "gpgpu_tool"
 description: "GPU parallel compute engine using wgpu. Invoke when user needs GPU-accelerated SHA-256 hashing, perceptual image hashing, BK-tree similarity search, or wants to build custom GPU compute pipelines on top of wgpu."
 ---
 
-# wgpu-compute-engine — Agent Usage Guide
+# gpgpu_tool — Agent Usage Guide
 
 Cross-platform GPU compute engine built on wgpu. Provides out-of-the-box GPU acceleration for CPU-intensive tasks without requiring WGSL shader authoring.
 
@@ -73,7 +73,7 @@ Cross-platform GPU compute engine built on wgpu. Provides out-of-the-box GPU acc
 ### Pattern 1: SHA-256 Parallel Hashing
 
 ```rust
-use wgpu_compute_engine::{GpuContext, tasks::sha256::Sha256Computer};
+use gpgpu_tool::{GpuContext, tasks::sha256::Sha256Computer};
 
 // Step 1: Create GPU context (do this ONCE, reuse everywhere)
 let mut ctx = GpuContext::new_sync()?;
@@ -95,8 +95,8 @@ let hashes: Vec<[u8; 32]> = sha256.compute(&ctx, &messages)?;
 ### Pattern 2: Perceptual Image Hashing
 
 ```rust
-use wgpu_compute_engine::{GpuContext, tasks::phasher::{PerceptualHasher, HashAlgorithm}};
-use wgpu_compute_engine::tasks::hash_common::HashSize;
+use gpgpu_tool::{GpuContext, tasks::phasher::{PerceptualHasher, HashAlgorithm}};
+use gpgpu_tool::tasks::hash_common::HashSize;
 
 let mut ctx = GpuContext::new_sync()?;
 
@@ -150,7 +150,7 @@ let hashes = hasher.compute(&ctx, &images, &dimensions)?;
 ### Pattern 4: BK-tree Similarity Search
 
 ```rust
-use wgpu_compute_engine::tasks::bktree::{BkTree, hamming_distance};
+use gpgpu_tool::tasks::bktree::{BkTree, hamming_distance};
 
 // Step 1: Build tree from hash values
 let tree = BkTree::from_hashes(hashes.iter().copied());
@@ -170,7 +170,7 @@ let nearest: Option<(u64, u32)> = tree.find_nearest(query_hash);
 ### Pattern 5: Custom GPU Compute Pipeline
 
 ```rust
-use wgpu_compute_engine::{GpuContext, GpuBuffer, BufferUsage, ComputePipeline};
+use gpgpu_tool::{GpuContext, GpuBuffer, BufferUsage, ComputePipeline};
 
 let mut ctx = GpuContext::new_sync()?;
 
@@ -210,13 +210,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) { ... }
 ### Pattern 6: Async Batch Submission
 
 ```rust
-use wgpu_compute_engine::{GpuContext, GpuBuffer, BufferUsage, BatchJob};
+use gpgpu_tool::{GpuContext, GpuBuffer, BufferUsage, BatchJob};
 use std::sync::Arc;
 
 let mut ctx = GpuContext::new_sync()?;
 let pipeline = ctx.get_or_create_pipeline(shader, [256, 1, 1])?;
 
-let mut submitter = wgpu_compute_engine::GpuBatchSubmitter::new();
+let mut submitter = gpgpu_tool::GpuBatchSubmitter::new();
 
 for batch_data in batches {
     let input = GpuBuffer::from_data(ctx.device(), &batch_data, BufferUsage::Storage);

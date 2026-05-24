@@ -94,7 +94,7 @@ fn to_wgpu_usage(usage: BufferUsage) -> BufferUsages {
 /// # 使用方式
 ///
 /// ```no_run
-/// use wgpu_compute_engine::{GpuContext, BufferPool, BufferUsage, BufferPoolConfig};
+/// use gpgpu_tool::{GpuContext, BufferPool, BufferUsage, BufferPoolConfig};
 ///
 /// let ctx = GpuContext::new_sync().unwrap();
 ///

@@ -1,9 +1,9 @@
 use std::time::Instant;
 
 use image::GenericImageView;
-use wgpu_compute_engine::GpuContext;
-use wgpu_compute_engine::tasks::bktree::{BkTree, hamming_distance};
-use wgpu_compute_engine::tasks::phasher::{HashAlgorithm, PerceptualHasher};
+use gpgpu_tool::GpuContext;
+use gpgpu_tool::tasks::bktree::{BkTree, hamming_distance};
+use gpgpu_tool::tasks::phasher::{HashAlgorithm, PerceptualHasher};
 
 fn brute_force_search(hashes: &[u64], query: u64, threshold: u32) -> Vec<(u64, u32)> {
     hashes

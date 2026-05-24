@@ -1,9 +1,9 @@
 [package]
-name = "wgpu-compute-engine"
+name = "gpgpu-tool"
 version = "0.2.0"
-description = "跨平台 GPU 并行加速引擎，基于 wgpu。提供 SHA-256、感知哈希、BK-tree 相似度搜索等开箱即用的 GPU 计算能力。"
+description = "GPGPU 加速算法库，基于 wgpu。优先使用 GPU 加速，支持 CPU 降级。提供 SHA-256、感知哈希、BK-tree 相似度搜索等开箱即用的 GPU 计算能力。"
 edition = "2021"
-license = "MIT"
+license = "GPL-3.0"
 readme = "README.md"
 repository = "https://github.com/solo-king/wgpu-tool"
 keywords = ["gpu", "compute", "wgpu", "parallel", "hashing"]
@@ -17,18 +17,22 @@ thiserror = "2"
 log = "0.4"
 image = { version = "0.25", optional = true }
 
+sha2 = { version = "0.10", optional = true }
+
 [features]
-default = []
+default = ["cpu-fallback"]
+cpu-fallback = ["dep:sha2"]
+pdq = []
 image = ["dep:image"]
 
 [dev-dependencies]
-sha2 = "0.10"
 rand = "0.9"
 criterion = { version = "0.5", features = ["html_reports"] }
 env_logger = "0.11"
 hex = "0.4"
 chrono = "0.4"
 image = "0.25"
+img_hash = "3.2"
 
 [package.metadata.docs.rs]
 features = ["image"]

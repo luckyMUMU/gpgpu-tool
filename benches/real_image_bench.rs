@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use image::GenericImageView;
-use wgpu_compute_engine::{
+use gpgpu_tool::{
     tasks::hash_common::PerceptualHashComputer,
     tasks::mean_hash::MeanHashComputer,
     tasks::median_hash::MedianHashComputer,

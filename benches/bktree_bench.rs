@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
-use wgpu_compute_engine::tasks::bktree::{BkTree, hamming_distance};
+use gpgpu_tool::tasks::bktree::{BkTree, hamming_distance};
 
 fn generate_clustered_hashes(clusters: usize, per_cluster: usize, spread: u32) -> Vec<u64> {
     use rand::Rng;

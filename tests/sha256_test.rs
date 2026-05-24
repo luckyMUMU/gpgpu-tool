@@ -1,4 +1,4 @@
-use wgpu_compute_engine::{tasks::sha256::Sha256Computer, GpuContext};
+use gpgpu_tool::{tasks::sha256::Sha256Computer, GpuContext};
 
 #[test]
 fn test_gpu_context_init() {

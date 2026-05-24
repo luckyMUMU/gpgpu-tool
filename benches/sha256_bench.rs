@@ -1,7 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use sha2::{Digest, Sha256};
-use wgpu_compute_engine::tasks::sha256::Sha256Computer;
-use wgpu_compute_engine::GpuContext;
+use gpgpu_tool::tasks::sha256::Sha256Computer;
+use gpgpu_tool::GpuContext;
 
 fn bench_single_block_batch(c: &mut Criterion) {
     let mut ctx = GpuContext::new_sync().expect("GPU 初始化失败");
@@ -126,7 +126,7 @@ fn bench_gpu_overhead_breakdown(c: &mut Criterion) {
 
     // 测试空提交开销（无实际计算）
     group.bench_function("empty_dispatch", |b| {
-        use wgpu_compute_engine::{BufferUsage, ComputePipeline, GpuBuffer};
+        use gpgpu_tool::{BufferUsage, ComputePipeline, GpuBuffer};
 
         let wgsl = r#"
             @compute @workgroup_size(1)

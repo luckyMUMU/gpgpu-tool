@@ -3,9 +3,9 @@ use std::path::Path;
 use std::time::Instant;
 
 use image::GenericImageView;
-use wgpu_compute_engine::GpuContext;
-use wgpu_compute_engine::tasks::phasher::{HashAlgorithm, PerceptualHasher};
-use wgpu_compute_engine::tasks::sha256::Sha256Computer;
+use gpgpu_tool::GpuContext;
+use gpgpu_tool::tasks::phasher::{HashAlgorithm, PerceptualHasher};
+use gpgpu_tool::tasks::sha256::Sha256Computer;
 
 const DATA_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data");
 

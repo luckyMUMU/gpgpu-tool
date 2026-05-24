@@ -6,7 +6,7 @@
 /// # 示例
 ///
 /// ```
-/// use wgpu_compute_engine::tasks::bktree::hamming_distance;
+/// use gpgpu_tool::tasks::bktree::hamming_distance;
 ///
 /// assert_eq!(hamming_distance(0, 0), 0);
 /// assert_eq!(hamming_distance(0xFFFFFFFFFFFFFFFF, 0), 64);
@@ -80,7 +80,7 @@ impl BkNode {
 /// # 使用示例
 ///
 /// ```no_run
-/// use wgpu_compute_engine::tasks::bktree::BkTree;
+/// use gpgpu_tool::tasks::bktree::BkTree;
 ///
 /// let hashes = vec![0xA1B2C3D4, 0x12345678, 0x87654321, 0xA1B2C3D5];
 /// let tree = BkTree::from_hashes(hashes.iter().copied());

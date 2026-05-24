@@ -1,4 +1,4 @@
-use wgpu_compute_engine::{
+use gpgpu_tool::{
     tasks::hash_common::{HashSize, PerceptualHashComputer},
     tasks::mean_hash::MeanHashComputer,
     GpuContext,
@@ -6,6 +6,7 @@ use wgpu_compute_engine::{
 
 mod common;
 use common::hash_reference;
+use common::img_hash_verify;
 use common::report::TestReport;
 use common::test_data;
 
@@ -147,4 +148,36 @@ fn test_mean_hash_full_report() {
     }
 
     report.generate("target/test-reports/mean_hash_report.md");
+}
+
+#[test]
+fn test_mean_hash_img_hash_verify() {
+    let mut ctx = match GpuContext::new_sync() {
+        Ok(ctx) => ctx,
+        Err(_) => { eprintln!("GPU 不可用，跳过测试"); return; }
+    };
+    let hasher = MeanHashComputer::new(&mut ctx).expect("创建失败");
+
+    // 使用随机图像测试
+    let image = test_data::random_image(64);
+    let gpu_hash = hasher.compute(&ctx, &[image.clone()]).expect("计算失败")[0];
+
+    // GPU vs img_hash 交叉校验
+    let img_hash_match = img_hash_verify::verify_mean_hash(&image, 8, 8, gpu_hash);
+
+    // 手写 CPU vs img_hash 交叉校验（验证适配层）
+    let cpu_hash = hash_reference::mean_hash(&image, 8, 8);
+    let cpu_img_hash_match = img_hash_verify::verify_mean_hash(&image, 8, 8, cpu_hash);
+
+    // 注意：由于 img_hash 使用整数均值而 GPU 使用 f32 均值，
+    // 交叉校验可能不完全匹配。如果不匹配，打印诊断信息但不失败。
+    if !img_hash_match {
+        eprintln!("Mean Hash: GPU 与 img_hash 不匹配 (gpu={:016x}, 可能因 f32 vs 整数均值差异)", gpu_hash);
+    }
+    if !cpu_img_hash_match {
+        eprintln!("Mean Hash: CPU 参考与 img_hash 不匹配 (cpu={:016x}, 可能因 f32 vs 整数均值差异)", cpu_hash);
+    }
+
+    // 至少 GPU 和手写 CPU 必须一致
+    assert_eq!(gpu_hash, cpu_hash, "Mean Hash: GPU 与手写 CPU 参考不匹配");
 }

@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use wgpu_compute_engine::{
+use gpgpu_tool::{
     tasks::sha256::Sha256Computer,
     GpuContext,
 };

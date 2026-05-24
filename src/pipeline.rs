@@ -1,9 +1,63 @@
 use wgpu::{
-    BindGroupLayout, CommandEncoder, ComputePipeline as WgpuComputePipeline, Device, Queue,
+    BindGroupLayout, BufferUsages, CommandEncoder,
+    ComputePipeline as WgpuComputePipeline, Device, Queue,
 };
 
 use crate::buffer::GpuBuffer;
 use crate::error::GpuError;
+
+/// 绑定类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BindingType {
+    StorageReadOnly,
+    StorageReadWrite,
+    Uniform,
+}
+
+impl BindingType {
+    /// 返回此绑定类型对应的 wgpu BufferBindingType。
+    pub fn buffer_binding_type(&self) -> wgpu::BufferBindingType {
+        match self {
+            BindingType::StorageReadOnly => wgpu::BufferBindingType::Storage { read_only: true },
+            BindingType::StorageReadWrite => wgpu::BufferBindingType::Storage { read_only: false },
+            BindingType::Uniform => wgpu::BufferBindingType::Uniform,
+        }
+    }
+
+    /// 返回此绑定类型对应的 BufferUsages。
+    pub fn buffer_usages(&self) -> BufferUsages {
+        match self {
+            BindingType::StorageReadOnly => BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            BindingType::StorageReadWrite => {
+                BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST
+            }
+            BindingType::Uniform => BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        }
+    }
+}
+
+/// 管线描述符，定义绑定布局。
+#[derive(Debug, Clone)]
+pub struct PipelineDescriptor {
+    pub bindings: Vec<BindingType>,
+    pub wgsl: &'static str,
+    pub workgroup_size: [u32; 3],
+}
+
+impl PipelineDescriptor {
+    /// 默认 3-binding 布局（StorageReadOnly, StorageReadWrite, Uniform）。
+    pub fn default_3_binding(wgsl: &'static str, workgroup_size: [u32; 3]) -> Self {
+        Self {
+            bindings: vec![
+                BindingType::StorageReadOnly,
+                BindingType::StorageReadWrite,
+                BindingType::Uniform,
+            ],
+            wgsl,
+            workgroup_size,
+        }
+    }
+}
 
 /// 计算管线，封装 WGSL 着色器的编译、绑定组创建和 dispatch 调度。
 ///
@@ -15,75 +69,52 @@ use crate::error::GpuError;
 /// 通常不直接构造，而是通过 `GpuContext::get_or_create_pipeline()` 获取缓存实例：
 ///
 /// ```no_run
-/// use wgpu_compute_engine::{GpuContext, GpuBuffer, BufferUsage};
+/// use gpgpu_tool::{GpuContext, PipelineDescriptor};
 ///
 /// let mut ctx = GpuContext::new_sync().unwrap();
 /// let pipeline = ctx.get_or_create_pipeline(
-///     include_str!("path/to/shader.wgsl"),
-///     [256, 1, 1],
+///     &PipelineDescriptor::default_3_binding(
+///         include_str!("path/to/shader.wgsl"),
+///         [256, 1, 1],
+///     ),
 /// ).unwrap();
 /// ```
 pub struct ComputePipeline {
     pipeline: WgpuComputePipeline,
     bind_group_layout: BindGroupLayout,
+    bindings: Vec<BindingType>,
     workgroup_size: [u32; 3],
 }
 
 impl ComputePipeline {
-    /// 从 WGSL 源码编译计算管线。
+    /// 从管线描述符编译计算管线。
     ///
-    /// `workgroup_size` 指定着色器 `@workgroup_size(x, y, z)` 参数，
-    /// 用于计算 dispatch 时的 workgroup 数量。
-    pub fn create(
-        device: &Device,
-        wgsl_source: &str,
-        workgroup_size: [u32; 3],
-    ) -> Result<Self, GpuError> {
+    /// `descriptor` 指定绑定布局、WGSL 源码和 workgroup 尺寸。
+    pub fn create(device: &Device, descriptor: &PipelineDescriptor) -> Result<Self, GpuError> {
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("compute_shader"),
-            source: wgpu::ShaderSource::Wgsl(wgsl_source.into()),
+            source: wgpu::ShaderSource::Wgsl(descriptor.wgsl.into()),
         });
 
-        let bind_group_layout_entry_0 = wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        };
-
-        let bind_group_layout_entry_1 = wgpu::BindGroupLayoutEntry {
-            binding: 1,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        };
-
-        let bind_group_layout_entry_2 = wgpu::BindGroupLayoutEntry {
-            binding: 2,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        };
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = descriptor
+            .bindings
+            .iter()
+            .enumerate()
+            .map(|(i, bt)| wgpu::BindGroupLayoutEntry {
+                binding: i as u32,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: bt.buffer_binding_type(),
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            })
+            .collect();
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("compute_bind_group_layout"),
-            entries: &[
-                bind_group_layout_entry_0,
-                bind_group_layout_entry_1,
-                bind_group_layout_entry_2,
-            ],
+            entries: &entries,
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -104,34 +135,25 @@ impl ComputePipeline {
         Ok(Self {
             pipeline,
             bind_group_layout,
-            workgroup_size,
+            bindings: descriptor.bindings.clone(),
+            workgroup_size: descriptor.workgroup_size,
         })
     }
 
-    fn create_bind_group(
-        &self,
-        device: &Device,
-        input_buffer: &GpuBuffer,
-        output_buffer: &GpuBuffer,
-        params_buffer: &GpuBuffer,
-    ) -> wgpu::BindGroup {
+    fn create_bind_group(&self, device: &Device, buffers: &[&GpuBuffer]) -> wgpu::BindGroup {
+        let entries: Vec<wgpu::BindGroupEntry> = buffers
+            .iter()
+            .enumerate()
+            .map(|(i, buf)| wgpu::BindGroupEntry {
+                binding: i as u32,
+                resource: buf.raw().as_entire_binding(),
+            })
+            .collect();
+
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("compute_bind_group"),
             layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: input_buffer.raw().as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: output_buffer.raw().as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: params_buffer.raw().as_entire_binding(),
-                },
-            ],
+            entries: &entries,
         })
     }
 
@@ -143,12 +165,10 @@ impl ComputePipeline {
         &self,
         device: &Device,
         queue: &Queue,
-        input_buffer: &GpuBuffer,
-        output_buffer: &GpuBuffer,
-        params_buffer: &GpuBuffer,
+        buffers: &[&GpuBuffer],
         dispatch_count: [u32; 3],
     ) {
-        let bind_group = self.create_bind_group(device, input_buffer, output_buffer, params_buffer);
+        let bind_group = self.create_bind_group(device, buffers);
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("dispatch_encoder"),
@@ -172,12 +192,10 @@ impl ComputePipeline {
         &self,
         device: &Device,
         encoder: &mut CommandEncoder,
-        input_buffer: &GpuBuffer,
-        output_buffer: &GpuBuffer,
-        params_buffer: &GpuBuffer,
+        buffers: &[&GpuBuffer],
         dispatch_count: [u32; 3],
     ) {
-        let bind_group = self.create_bind_group(device, input_buffer, output_buffer, params_buffer);
+        let bind_group = self.create_bind_group(device, buffers);
 
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -193,5 +211,10 @@ impl ComputePipeline {
     /// 返回此管线的 workgroup 尺寸。
     pub fn workgroup_size(&self) -> [u32; 3] {
         self.workgroup_size
+    }
+
+    /// 返回此管线的绑定类型列表。
+    pub fn bindings(&self) -> &[BindingType] {
+        &self.bindings
     }
 }

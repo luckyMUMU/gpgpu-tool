@@ -81,9 +81,7 @@ impl GpuBatchSubmitter {
         job.pipeline.encode_dispatch_into(
             &device,
             encoder,
-            &job.input,
-            &job.output,
-            &job.params,
+            &[&job.input, &job.output, &job.params],
             job.dispatch,
         );
 

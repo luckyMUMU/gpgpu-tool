@@ -8,7 +8,10 @@ use crate::buffer::{BufferUsage, GpuBuffer};
 use crate::buffer_pool::{BufferPool, BufferPoolConfig};
 use crate::context::GpuContext;
 use crate::error::GpuError;
-use crate::pipeline::ComputePipeline;
+use crate::pipeline::{ComputePipeline, PipelineDescriptor};
+#[cfg(feature = "cpu-fallback")]
+use crate::tasks::sha256_cpu::Sha256Cpu;
+use crate::ComputeBackend;
 
 const SHA256_WGSL: &str = include_str!("sha256.wgsl");
 const SHA256_CHAINED_WGSL: &str = include_str!("sha256_chained.wgsl");
@@ -37,7 +40,7 @@ const MAX_SINGLE_BLOCK_MSG_LEN: usize = 55;
 /// # 示例
 ///
 /// ```no_run
-/// use wgpu_compute_engine::{GpuContext, tasks::sha256::Sha256Computer};
+/// use gpgpu_tool::{GpuContext, tasks::sha256::Sha256Computer};
 ///
 /// let mut ctx = GpuContext::new_sync().unwrap();
 /// let sha256 = Sha256Computer::new(&mut ctx).unwrap();
@@ -65,7 +68,7 @@ pub struct Sha256Computer {
 /// # 使用方式
 ///
 /// ```no_run
-/// use wgpu_compute_engine::{GpuContext, tasks::sha256::Sha256Computer};
+/// use gpgpu_tool::{GpuContext, tasks::sha256::Sha256Computer};
 ///
 /// let mut ctx = GpuContext::new_sync().unwrap();
 /// let sha256 = Sha256Computer::new(&mut ctx).unwrap();
@@ -122,8 +125,12 @@ impl Sha256Computer {
         workgroup_size: [u32; 3],
         buffer_pool: BufferPool,
     ) -> Result<Self, GpuError> {
-        let pipeline = ctx.get_or_create_pipeline(SHA256_WGSL, workgroup_size)?;
-        let pipeline_chained = ctx.get_or_create_pipeline(SHA256_CHAINED_WGSL, workgroup_size)?;
+        let pipeline = ctx.get_or_create_pipeline(
+            &PipelineDescriptor::default_3_binding(SHA256_WGSL, workgroup_size),
+        )?;
+        let pipeline_chained = ctx.get_or_create_pipeline(
+            &PipelineDescriptor::default_3_binding(SHA256_CHAINED_WGSL, workgroup_size),
+        )?;
         Ok(Self {
             pipeline,
             pipeline_chained,
@@ -134,11 +141,23 @@ impl Sha256Computer {
     }
 
     /// 批量计算 SHA-256 哈希（同步接口）。
+    ///
+    /// 当 `GpuContext` 处于 CPU 降级模式时，自动委托到 [`Sha256Cpu`] 计算。
     pub fn compute(
         &self,
         ctx: &GpuContext,
         messages: &[Vec<u8>],
     ) -> Result<Vec<[u8; 32]>, GpuError> {
+        if ctx.backend() == ComputeBackend::Cpu {
+            #[cfg(feature = "cpu-fallback")]
+            {
+                let cpu = Sha256Cpu::new();
+                return cpu.compute(messages);
+            }
+            #[cfg(not(feature = "cpu-fallback"))]
+            return Err(GpuError::CpuFallback("CPU 降级未启用".to_string()));
+        }
+
         if messages.is_empty() {
             return Ok(vec![]);
         }
@@ -227,9 +246,7 @@ impl Sha256Computer {
         self.pipeline.dispatch(
             device,
             queue,
-            &input_buffer,
-            &output_buffer,
-            &params_buffer,
+            &[&input_buffer, &output_buffer, &params_buffer],
             [dispatch_x, 1, 1],
         );
 
@@ -313,7 +330,7 @@ impl Sha256Computer {
 
         let dispatch_x = (count as u32).div_ceil(self.workgroup_size[0]).max(1);
         self.pipeline_chained.dispatch(
-            device, queue, &input_buffer, &output_buffer, &params_buffer, [dispatch_x, 1, 1],
+            device, queue, &[&input_buffer, &output_buffer, &params_buffer], [dispatch_x, 1, 1],
         );
 
         let result = output_buffer.download(device, queue)?;
@@ -503,9 +520,7 @@ impl<'a> Sha256BatchSubmitter<'a> {
         self.computer.pipeline.encode_dispatch_into(
             self.device,
             encoder,
-            &input_buffer,
-            &output_buffer,
-            &params_buffer,
+            &[&input_buffer, &output_buffer, &params_buffer],
             [dispatch_x, 1, 1],
         );
 
@@ -568,7 +583,7 @@ impl<'a> Sha256BatchSubmitter<'a> {
         let encoder = self.encoder.as_mut().unwrap();
 
         self.computer.pipeline_chained.encode_dispatch_into(
-            self.device, encoder, &input_gpu, &output_gpu, &params_buf, [1, 1, 1],
+            self.device, encoder, &[&input_gpu, &output_gpu, &params_buf], [1, 1, 1],
         );
 
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {

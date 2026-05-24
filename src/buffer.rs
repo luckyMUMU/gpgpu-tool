@@ -40,7 +40,7 @@ fn to_wgpu_usage(usage: BufferUsage) -> BufferUsages {
 /// # 示例
 ///
 /// ```no_run
-/// use wgpu_compute_engine::{GpuContext, GpuBuffer, BufferUsage};
+/// use gpgpu_tool::{GpuContext, GpuBuffer, BufferUsage};
 ///
 /// let ctx = GpuContext::new_sync().unwrap();
 /// let data: Vec<u32> = vec![1, 2, 3, 4];

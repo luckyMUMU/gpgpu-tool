@@ -1,4 +1,4 @@
-use wgpu_compute_engine::{
+use gpgpu_tool::{
     tasks::hash_common::{HashSize, PerceptualHashComputer},
     tasks::median_hash::MedianHashComputer,
     GpuContext,

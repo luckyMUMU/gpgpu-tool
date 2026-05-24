@@ -1,12 +1,12 @@
-# wgpu-compute-engine 技术架构文档
+# GPGPU-tool 技术架构文档
 
-> **版本**: 0.2.0 | **Rust Edition**: 2021 | **wgpu**: v24 | **生成日期**: 2026-05-23
+> **版本**: 0.2.0 | **Rust Edition**: 2021 | **wgpu**: v24 | **生成日期**: 2026-05-24
 
 ---
 
 ## 1. 项目概述
 
-wgpu-compute-engine 是一个基于 wgpu 的跨平台 GPU 通用计算引擎，为 CPU 密集型任务提供 GPU 并行加速能力。项目采用**能力层与业务层分离**的两层架构，能力层封装 wgpu 底层细节，业务层实现具体算法。
+GPGPU-tool 是一个基于 wgpu 的跨平台 GPU 通用计算引擎，为 CPU 密集型任务提供 GPU 并行加速能力。项目采用**能力层与业务层分离**的两层架构，能力层封装 wgpu 底层细节，业务层实现具体算法。当 GPU 不可用时，自动降级到 CPU 实现。
 
 ### 1.1 核心特性
 
@@ -20,6 +20,10 @@ wgpu-compute-engine 是一个基于 wgpu 的跨平台 GPU 通用计算引擎，�
 | **BK-tree 近似搜索** | O(log N) 汉明距离最近邻搜索 |
 | **算法可扩展** | 新算法只需实现 `.rs` + `.wgsl` 配对，复用能力层基础设施 |
 | **灵活 HashSize** | 支持 8/16/32/64 网格尺寸，输出 64-4096 bit 哈希 |
+| **GPU 2D 卷积** | 支持 Full2D 和 Separable 两种卷积模式，3 种边界处理 |
+| **二面体变换** | D4 群 8 种旋转/翻转，无需重算哈希即可匹配旋转图像 |
+| **PDQ 哈希** | GPU DCT-II + CPU 量化，256-bit 频域感知哈希 |
+| **GPU 优先，CPU 降级** | GPU 初始化失败时自动降级到 CPU 实现，调用方无感知 |
 
 ### 1.2 技术栈
 
@@ -37,41 +41,53 @@ image v0.25       → 可选：图像加载与缩放（feature-gated）
 ## 2. 架构总览
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                         业务层 (Business)                          │
-│                                                                  │
-│  ┌──────────────┐  ┌──────────────────┐  ┌────────────────────┐ │
-│  │ Sha256Computer│  │ PerceptualHasher │  │      BkTree        │ │
-│  │ (SHA-256 哈希)│  │ ┌─────┐┌──────┐ │  │ (BK-tree 最近邻)    │ │
-│  │ + BatchSubmit │  │ │Mean ││Median│ │  │ + hamming_distance │ │
-│  └──────┬───────┘  │ └─────┘└──────┘ │  └────────────────────┘ │
-│         │          │ + gpu_resize     │                          │
-│         │          │ (零拷贝缩放流水线) │                          │
-│         │          └────────┬─────────┘                          │
-│         │                   │                                    │
-│         │    hash_common: PerceptualHashComputer trait + macros  │
-└─────────┼───────────────────┼────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                         业务层 (Business)                                 │
+│                                                                          │
+│  ┌──────────────┐  ┌──────────────────┐  ┌────────────────────┐        │
+│  │ Sha256Computer│  │ PerceptualHasher │  │      BkTree        │        │
+│  │ (SHA-256 哈希)│  │ ┌─────┐┌──────┐ │  │ (BK-tree 最近邻)    │        │
+│  │ + BatchSubmit │  │ │Mean ││Median│ │  │ + hamming_distance │        │
+│  └──────┬───────┘  │ └─────┘└──────┘ │  └────────────────────┘        │
+│         │          │ + gpu_resize     │                                  │
+│         │          │ (零拷贝缩放流水线) │                                  │
+│         │          └────────┬─────────┘                                  │
+│         │                   │                                            │
+│         │    hash_common: PerceptualHashComputer trait + macros           │
+│                                                                          │
+│  ┌──────────────┐  ┌──────────────────┐  ┌────────────────────┐        │
+│  │GpuConvolution│  │ GpuGaussianBlur  │  │  Dihedral Transforms│        │
+│  │ (2D 卷积)    │  │ (高斯模糊)        │  │  (D4 群 8 变换)     │        │
+│  │ Full2D/Sep   │  │ (基于可分离卷积)  │  │  8×8 / 16×16       │        │
+│  └──────┬───────┘  └────────┬─────────┘  └────────────────────┘        │
+│         │                   │                                            │
+│  ┌──────────────┐  ┌──────────────────┐  ┌────────────────────┐        │
+│  │ PdqHashGpu   │  │ HashMatcherFacade│  │    pixel_pack      │        │
+│  │ (PDQ DCT-II) │  │ Linear/BkTree/   │  │  (u8↔u32 转换)     │        │
+│  │ feature: pdq │  │ Chained + Dihedral│  │                    │        │
+│  └──────────────┘  └──────────────────┘  └────────────────────┘        │
+└──────────────────────────────────────────────────────────────────────────┘
           │                   │
-┌─────────┼───────────────────┼────────────────────────────────────┐
-│         ▼                   ▼                                    │
-│                     能力层 (Capability Layer)                      │
-│                                                                  │
-│  ┌────────────┐  ┌──────────┐  ┌──────────────────┐              │
-│  │ GpuContext │  │GpuBuffer │  │  ComputePipeline  │              │
-│  │ ·device    │  │ ·upload  │  │  ·shader compile  │              │
-│  │ ·queue     │  │ ·download│  │  ·bind group      │              │
-│  │ ·pipeline  │  │ ·write   │  │  ·dispatch        │              │
-│  │   cache    │  └──────────┘  └──────────────────┘              │
-│  └────────────┘  ┌──────────┐                                    │
-│  ┌────────────┐  │BufferPool│                                    │
-│  │GpuBatch    │  │ ·acquire │                                    │
-│  │Submitter   │  │ ·release │                                    │
-│  │ ·submit    │  └──────────┘                                    │
-│  │ ·wait_all  │  ┌──────────┐                                    │
-│  └────────────┘  │ GpuError │                                    │
-│                  │ (9 variants)                                   │
-│                  └──────────┘                                    │
-└──────────────────────────────────────────────────────────────────┘
+┌─────────┼───────────────────┼────────────────────────────────────────────┐
+│         ▼                   ▼                                            │
+│                     能力层 (Capability Layer)                              │
+│                                                                          │
+│  ┌────────────┐  ┌──────────┐  ┌──────────────────┐                      │
+│  │ GpuContext │  │GpuBuffer │  │  ComputePipeline  │                      │
+│  │ ·device    │  │ ·upload  │  │  ·shader compile  │                      │
+│  │ ·queue     │  │ ·download│  │  ·bind group      │                      │
+│  │ ·pipeline  │  │ ·write   │  │  ·dispatch        │                      │
+│  │   cache    │  └──────────┘  └──────────────────┘                      │
+│  └────────────┘  ┌──────────┐                                            │
+│  ┌────────────┐  │BufferPool│                                            │
+│  │GpuBatch    │  │ ·acquire │                                            │
+│  │Submitter   │  │ ·release │                                            │
+│  │ ·submit    │  └──────────┘                                            │
+│  │ ·wait_all  │  ┌──────────┐                                            │
+│  └────────────┘  │ GpuError │                                            │
+│                  │ (11 variants)                                          │
+│                  └──────────┘                                            │
+└──────────────────────────────────────────────────────────────────────────┘
                           │
                           ▼
               ┌───────────────────────┐
@@ -85,7 +101,8 @@ image v0.25       → 可选：图像加载与缩放（feature-gated）
 | 层级 | 职责 | 模块 |
 |------|------|------|
 | **能力层** | wgpu 封装：设备管理、缓冲区传输、管线编译与缓存、批量提交 | `context`, `buffer`, `buffer_pool`, `pipeline`, `batch`, `error` |
-| **业务层** | 算法实现：SHA-256、感知哈希（6 种）、BK-tree 近似搜索、GPU 缩放 | `tasks/sha256`, `tasks/phasher`, `tasks/bktree`, `tasks/gpu_resize`, `tasks/hash_common` |
+| **业务层** | 算法实现：SHA-256、感知哈希（6 种）、BK-tree 近似搜索、GPU 缩放、2D 卷积、高斯模糊、二面体变换、PDQ 哈希、哈希匹配 | `tasks/sha256`, `tasks/phasher`, `tasks/bktree`, `tasks/gpu_resize`, `tasks/hash_common`, `tasks/convolution`, `tasks/gaussian_blur`, `tasks/dihedral`, `tasks/matcher`, `tasks/pdq_hash` |
+| **工具层** | 像素格式转换等通用工具 | `pixel_pack` |
 
 ---
 
@@ -296,9 +313,9 @@ wait_all()  → queue.submit(encoder) → device.poll(Wait)
 
 ### 3.6 GpuError — 统一错误类型
 
-**文件**: `src/error.rs` (32 行)
+**文件**: `src/error.rs` (38 行)
 
-**职责**: 覆盖 GPU 计算全生命周期的错误场景。
+**职责**: 覆盖 GPU 计算全生命周期的错误场景，包含 GPU 和 CPU 降级两种路径的错误。
 
 ```rust
 pub enum GpuError {
@@ -308,13 +325,19 @@ pub enum GpuError {
     MapFailed(String),                  // 缓冲区映射失败
     Validation(String),                 // GPU 验证错误
     DeviceLost,                         // 设备丢失
-    Oom { requested, limit },           // 显存不足
+    Oom { requested: u64, limit: u64 }, // 显存不足
     Internal(String),                   // 内部错误
     InvalidInput(String),               // 无效输入
+    CpuFallback(String),                // CPU 降级执行失败
+    Timeout { ms: u64 },               // GPU 计算超时
 }
 ```
 
-使用 `thiserror` 派生，所有变体自带 `Display` 实现。
+使用 `thiserror` 派生，所有 11 个变体自带 `Display` 实现。
+
+**新增变体说明**:
+- `CpuFallback(String)`: CPU 降级路径执行失败时的错误，保证 GPU/CPU 双路径的统一错误处理
+- `Timeout { ms: u64 }`: GPU 计算超时，携带超时毫秒数，用于长时间计算场景的超时检测
 
 ---
 
@@ -567,7 +590,285 @@ BkTree
 感知哈希 → BK-tree 索引 → 阈值搜索返回相似图像
 ```
 
-### 4.7 算法一览
+### 4.7 GpuConvolution — GPU 2D 卷积
+
+**文件**: `src/tasks/convolution.rs` (~367 行) + `src/tasks/convolution.wgsl` (~118 行)
+
+**职责**: GPU 加速的 2D 卷积计算，支持 Full2D 和 Separable 两种模式，3 种边界处理方式。
+
+**核心结构**:
+```
+GpuConvolution
+├── pipeline: Arc<ComputePipeline>       # 卷积管线
+├── workgroup_size: [u32; 3] = [256,1,1] # 工作组大小
+└── buffer_pool: BufferPool              # 缓冲区复用
+```
+
+**卷积模式 (ConvMode)**:
+
+| 模式 | 说明 | 计算量 |
+|------|------|--------|
+| `Full2D` | 不可分离 2D 卷积（单趟） | O(W×H×K²) |
+| `Separable` | 可分离卷积（水平 + 垂直两趟 1D） | O(W×H×K×2) |
+
+**边界处理 (BorderMode)**:
+
+| 模式 | 说明 |
+|------|------|
+| `Zero` | 越界像素值为 0 |
+| `Clamp` | 钳制到最近的边缘像素 |
+| `Reflect` | 半样本对称镜像反射 |
+
+**Uniform 参数 (ConvParams)**:
+```rust
+#[repr(C)]
+struct ConvParams {
+    width: u32,
+    height: u32,
+    kernel_size: u32,       // 卷积核边长（最大 11）
+    kernel_radius: u32,     // kernel_size / 2
+    border_mode: u32,       // 0=Zero, 1=Clamp, 2=Reflect
+    pass_mode: u32,         // 0=Full2D, 1=Horizontal1D, 2=Vertical1D
+    _pad1: u32,
+    _pad2: u32,
+    kernel: [f32; 124],     // 卷积核数据，填充至 124 满足 16 字节对齐
+}
+```
+
+**Full2D 卷积流程**:
+```
+输入像素 → pack_u8_to_u32 → 上传到 GPU
+→ dispatch (单趟 2D 卷积)
+→ 下载结果 → unpack_u32_to_u8 → 返回 Vec<u8>
+```
+
+**Separable 卷积流程**:
+```
+输入像素 → pack_u8_to_u32 → 上传到 GPU
+→ 单 encoder 编码两趟 dispatch:
+  第一趟: 水平 1D 卷积 (input → intermediate)
+  第二趟: 垂直 1D 卷积 (intermediate → output)
+→ 一次 queue.submit() 提交两趟
+→ 下载结果 → unpack_u32_to_u8 → 返回 Vec<u8>
+```
+
+**零拷贝接口**: `convolve_separable_gpu()` 接收 GpuBuffer 输入，返回 GpuBuffer 输出，
+支持与下游模块（如高斯模糊、感知哈希）组成零拷贝流水线。
+
+**卷积核限制**: 最大边长 11（11×11 = 121 个 f32），kernel 数组固定 124 个 f32。
+
+### 4.8 GpuGaussianBlur — GPU 高斯模糊
+
+**文件**: `src/tasks/gaussian_blur.rs` (~116 行)
+
+**职责**: 基于可分离卷积实现 GPU 高斯模糊，用于感知哈希的图像降噪预处理。
+
+**核心结构**:
+```
+GpuGaussianBlur
+└── convolution: GpuConvolution  # 委托给 GpuConvolution 执行
+```
+
+**设计**: GpuGaussianBlur 是 GpuConvolution 的高层封装，自动生成 1D 高斯核后调用可分离卷积。
+
+**高斯核生成**:
+- 使用高斯函数 G(x) = exp(-x²/(2σ²))，归一化后使核元素之和为 1
+- sigma ≤ 0 时自动计算为 `0.3 * ((kernel_size - 1) * 0.5 - 1) + 0.8`（OpenCV 默认公式）
+- kernel_size 必须为正奇数（3/5/7/9/11），最大 11
+
+**公开 API**:
+
+| 方法 | 说明 |
+|------|------|
+| `blur(ctx, pixels, width, height, kernel_size, sigma)` | CPU 输入 → CPU 输出 |
+| `blur_gpu(ctx, input_buffer, count, width, height, kernel_size, sigma)` | GPU 输入 → GPU 输出（零拷贝） |
+
+**边界模式**: 固定使用 `BorderMode::Clamp`（钳制到边缘），适合图像处理场景。
+
+### 4.9 Dihedral Transforms — 二面体变换
+
+**文件**: `src/tasks/dihedral.rs` (~539 行)
+
+**职责**: 对哈希位矩阵执行 D4 群的 8 种旋转/翻转变换，无需重新计算图像哈希即可匹配旋转/翻转后的图像。
+
+**8 种变换**:
+
+| 变换 | 说明 | 数学描述 |
+|------|------|----------|
+| `original` | 原始 | — |
+| `rotate90` | 顺时针旋转 90° | new[col][N-1-row] = old[row][col] |
+| `rotate180` | 旋转 180° | new[N-1-row][N-1-col] = old[row][col] |
+| `rotate270` | 顺时针旋转 270° | new[N-1-col][row] = old[row][col] |
+| `flip_h` | 水平翻转（左右镜像） | new[row][N-1-col] = old[row][col] |
+| `flip_v` | 垂直翻转（上下镜像） | new[N-1-row][col] = old[row][col] |
+| `flip_diag` | 主对角线翻转（转置） | new[col][row] = old[row][col] |
+| `flip_anti_diag` | 反对角线翻转 | new[N-1-col][N-1-row] = old[row][col] |
+
+**支持的矩阵尺寸**:
+
+| 类型 | 矩阵尺寸 | 哈希位宽 | 输出格式 |
+|------|---------|---------|---------|
+| `DihedralHashes64` | 8×8 | 64 bit | 每种变换 1 个 u64 |
+| `DihedralHashes256` | 16×16 | 256 bit | 每种变换 4 个 u64 |
+
+**核心结构**:
+```rust
+pub struct DihedralHashes64 {
+    pub original: u64,
+    pub rotate90: u64,
+    pub rotate180: u64,
+    pub rotate270: u64,
+    pub flip_h: u64,
+    pub flip_v: u64,
+    pub flip_diag: u64,
+    pub flip_anti_diag: u64,
+}
+
+pub struct DihedralHashes256 {
+    pub original: [u64; 4],
+    pub rotate90: [u64; 4],
+    pub rotate180: [u64; 4],
+    pub rotate270: [u64; 4],
+    pub flip_h: [u64; 4],
+    pub flip_v: [u64; 4],
+    pub flip_diag: [u64; 4],
+    pub flip_anti_diag: [u64; 4],
+}
+```
+
+**创建方式**:
+- `DihedralHashes64::from_u64(hash)`: 从 u64 哈希值推导所有变体
+- `DihedralHashes64::from_bits(bits)`: 从 8×8 位矩阵推导所有变体
+- `DihedralHashes256::from_u64_array(hash)`: 从 [u64; 4] 推导所有变体
+- `DihedralHashes256::from_bits(bits)`: 从 16×16 位矩阵推导所有变体
+
+**位打包**: LSB-first 编码，bit i 在 byte i/8 的 bit i%8 位置。
+
+**群性质**: D4 群封闭性保证任意两种变换的组合等价于群中另一种变换（如 rotate90 + flip_h = flip_anti_diag）。
+
+### 4.10 Hash Matcher — 哈希匹配策略
+
+**文件**: `src/tasks/matcher.rs` (~324 行)
+
+**职责**: 提供统一的哈希匹配抽象和多种策略实现，支持策略模式组合和二面体变换增强。
+
+**核心类型**:
+
+```rust
+pub struct MatchResult {
+    pub hash: u64,
+    pub distance: u32,
+}
+
+pub trait HashMatcher {
+    fn find_similar(&self, query: u64, threshold: u32) -> Vec<MatchResult>;
+}
+```
+
+**策略实现**:
+
+| 匹配器 | 说明 | 召回率 | 速度 |
+|--------|------|--------|------|
+| `LinearScanMatcher` | 精确线性扫描 | 100% | O(N) |
+| `BkTreeMatcher` | BK-tree 近似匹配 | 近似 | O(log N) |
+| `ChainedMatcher` | 责任链组合多个匹配器 | 取决于策略 | 取决于组合 |
+| `HashMatcherFacade` | 统一门面 + 二面体变换增强 | 取决于内部策略 | 取决于组合 |
+
+**责任链策略 (ChainStrategy)**:
+
+| 策略 | 说明 |
+|------|------|
+| `Union` | 合并所有匹配器结果（并集去重） |
+| `FirstHit` | 第一个有结果的匹配器后停止 |
+
+**ChainedMatcher 预设**: `bk_tree_plus_linear()` 创建 BK-tree + 线性扫描的 Union 责任链。
+
+**HashMatcherFacade 门面**:
+- `linear_scan(hashes)`: 创建精确线性扫描门面
+- `bktree(hashes)`: 创建 BK-tree 门面
+- `chained(hashes)`: 创建责任链门面
+- `with_dihedral()`: 启用二面体变换匹配（对查询哈希的 8 种 D4 变体分别匹配，结果去重）
+
+**二面体变换匹配流程**:
+```
+query hash → DihedralHashes64::from_u64(query) → 8 种变体
+→ 对每种变体调用内部 matcher.find_similar()
+→ 合并去重结果 → 返回 Vec<MatchResult>
+```
+
+### 4.11 PDQ Hash — PDQ 感知哈希
+
+**文件**: `src/tasks/pdq_hash.rs` (~307 行) + `src/tasks/pdq_hash.wgsl` (~60 行)
+
+**Feature flag**: `pdq`（需显式启用）
+
+**职责**: 基于 DCT-II 频域变换的感知哈希算法（Meta/Facebook PDQ），输入 64×64 灰度图像，输出 256-bit 哈希 + 质量评分。
+
+**GPU/CPU 双实现**:
+
+| 实现 | DCT-II | 量化/打包 | 说明 |
+|------|--------|----------|------|
+| `PdqHashGpu` | GPU 两趟可分离 DCT | CPU 中值量化 + 打包 | GPU 加速频域变换 |
+| `PdqHashCpu` | CPU 两趟可分离 DCT | CPU 中值量化 + 打包 | 纯 CPU 降级实现 |
+
+**PdqHashGpu 核心结构**:
+```
+PdqHashGpu
+├── pipeline: Arc<ComputePipeline>       # DCT-II 管线
+├── workgroup_size: [u32; 3] = [256,1,1] # 工作组大小
+└── buffer_pool: BufferPool              # 缓冲区复用
+```
+
+**GPU DCT-II 流程**:
+```
+64×64 灰度像素 → pack_u8_to_u32 → 上传到 GPU
+→ 单 encoder 编码两趟 dispatch:
+  第一趟: 水平 1D-DCT (input → intermediate)
+  第二趟: 垂直 1D-DCT (intermediate → output)
+→ 一次 queue.submit() 提交两趟
+→ 下载结果 → bitcast u32→f32 → CPU 量化
+```
+
+**CPU 量化流程**:
+```
+DCT 系数 → 取左上 16×16 = 256 个低频系数
+→ 排序求中值 → 每个系数与中值比较生成 bit
+→ pack_bits_to_u64 → [u64; 4] (256-bit 哈希)
+→ compute_quality → 质量评分 (0.0-1.0)
+```
+
+**PdqHashResult**:
+```rust
+pub struct PdqHashResult {
+    pub hash: [u64; 4],  // 256-bit 哈希值
+    pub quality: f32,     // 质量评分（0.0-1.0，越高越可靠）
+}
+```
+
+**质量评分**: 基于 DCT 系数与中值的平均偏差，偏差越大区分度越高，质量越好。
+
+**WGSL Shader** (`pdq_hash.wgsl`):
+- 水平模式: 输入 u32 像素值，输出 f32 DCT 系数（bitcast 为 u32 存储）
+- 垂直模式: 输入 f32 中间结果（bitcast 为 u32 存储），输出 f32 DCT 系数
+
+**PerceptualHashComputer trait**: `PdqHashGpu` 实现了 `PerceptualHashComputer`，可集成到感知哈希统一框架。
+
+### 4.12 pixel_pack — 像素格式转换
+
+**文件**: `src/pixel_pack.rs` (~9 行)
+
+**职责**: u8↔u32 像素格式转换工具，为 GPU 缓冲区提供标准化的像素打包/解包。
+
+**公开 API**:
+
+| 函数 | 说明 |
+|------|------|
+| `pack_u8_to_u32(pixels: &[u8]) -> Vec<u32>` | 将 u8 灰度像素数组打包为 u32 数组（每像素 1 个 u32） |
+| `unpack_u32_to_u8(data: &[u32], count: usize) -> Vec<u8>` | 将 u32 数组解包为 u8 灰度像素数组 |
+
+**使用场景**: GPU 着色器以 u32 为基本像素单元，CPU 侧以 u8 灰度为主，pixel_pack 提供两者之间的零语义损失转换。
+
+### 4.13 算法一览
 
 | 文件 | WGSL | 行数 | 说明 |
 |------|------|------|------|
@@ -576,6 +877,11 @@ BkTree
 | `hash_common.rs` | — | ~200 | 共享 trait + 宏 + 零拷贝入口 |
 | `gpu_resize.rs` | `resize.wgsl` | ~250 | GPU box filter 缩放 |
 | `bktree.rs` | — | ~120 | BK-tree 近似搜索 |
+| `convolution.rs` | `convolution.wgsl` | ~367 + ~118 | GPU 2D 卷积（Full2D/Separable） |
+| `gaussian_blur.rs` | — | ~116 | GPU 高斯模糊（基于可分离卷积） |
+| `dihedral.rs` | — | ~539 | D4 群二面体变换（8×8 / 16×16） |
+| `matcher.rs` | — | ~324 | 哈希匹配策略（Linear/BkTree/Chained/Facade） |
+| `pdq_hash.rs` | `pdq_hash.wgsl` | ~307 + ~60 | PDQ 哈希（GPU DCT-II + CPU 量化），feature: pdq |
 | `mean_hash.rs` | `mean_hash.wgsl` | 14 + ~40 | 均值哈希 |
 | `median_hash.rs` | `median_hash.wgsl` | 14 + ~40 | 中值哈希 |
 | `gradient_hash.rs` | `gradient_hash.wgsl` | 14 + ~40 | 梯度哈希 |
@@ -667,6 +973,68 @@ PerceptualHasher::compute()  (gpu_resize 启用时)
         └── 插入缓存 → 返回 Arc
 ```
 
+### 5.5 卷积流水线数据流
+
+```
+GpuConvolution::convolve_separable()
+    │
+    ├── 输入像素 → pixel_pack::pack_u8_to_u32() → Vec<u32>
+    │
+    ├── BufferPool.acquire() × 3 → input, intermediate, output
+    ├── queue.write_buffer() → 上传到 input buffer
+    │
+    ├── 单 encoder 编码两趟:
+    │   ├── 第一趟: 水平 1D 卷积
+    │   │   ├── build_params(pass_mode=1) → ConvParams
+    │   │   ├── GpuBuffer::from_data() → params_buffer_h
+    │   │   └── pipeline.encode_dispatch_into(input → intermediate)
+    │   │
+    │   └── 第二趟: 垂直 1D 卷积
+    │       ├── build_params(pass_mode=2) → ConvParams
+    │       ├── GpuBuffer::from_data() → params_buffer_v
+    │       └── pipeline.encode_dispatch_into(intermediate → output)
+    │
+    ├── queue.submit(encoder.finish()) → 一次提交两趟
+    ├── output.download_with_pool() → 读取结果
+    ├── BufferPool.release() × 3 → 归还缓冲区
+    │
+    └── pixel_pack::unpack_u32_to_u8() → Vec<u8>
+```
+
+**高斯模糊零拷贝流水线**:
+```
+GpuGaussianBlur::blur_gpu()
+    │
+    ├── generate_gaussian_kernel_1d() → 1D 高斯核
+    └── convolution.convolve_separable_gpu()
+        → 输入 GpuBuffer → 输出 GpuBuffer（数据全程在 GPU）
+```
+
+### 5.6 PDQ 哈希数据流
+
+```
+PdqHashGpu::compute()
+    │
+    ├── 输入图像 (64×64 灰度) → pixel_pack::pack_u8_to_u32() → Vec<u32>
+    │
+    ├── BufferPool.acquire() × 3 → input, intermediate, output
+    ├── queue.write_buffer() → 上传到 input buffer
+    │
+    ├── 单 encoder 编码两趟 DCT-II:
+    │   ├── 水平 1D-DCT (pass_mode=0): input → intermediate
+    │   └── 垂直 1D-DCT (pass_mode=1): intermediate → output
+    │
+    ├── queue.submit(encoder.finish()) → 一次提交
+    ├── output.download_with_pool() → 读取结果
+    ├── BufferPool.release() × 3 → 归还缓冲区
+    │
+    └── CPU 后处理:
+        ├── bitcast u32 → f32 → DCT 系数
+        ├── 取左上 16×16 低频系数 (256 个)
+        ├── 排序求中值 → 二值化 → pack_bits_to_u64()
+        └── 返回 Vec<u64> (每图 4 个 u64 = 256-bit)
+```
+
 ---
 
 ## 6. 模块依赖关系
@@ -679,6 +1047,7 @@ lib.rs
 ├── context        → error, pipeline
 ├── error          → (无依赖)
 ├── pipeline       → buffer, error
+├── pixel_pack     → (无依赖)
 └── tasks
     ├── mod.rs     → (导出子模块)
     ├── sha256     → buffer, buffer_pool, context, error, pipeline
@@ -686,6 +1055,11 @@ lib.rs
     ├── hash_common → buffer, context, error, pipeline
     ├── gpu_resize → buffer, buffer_pool, context, error, pipeline
     ├── bktree     → (无依赖, 纯算法)
+    ├── convolution → buffer, buffer_pool, context, error, pipeline, pixel_pack
+    ├── gaussian_blur → convolution, context, error, buffer_pool
+    ├── dihedral   → (无依赖, 纯算法)
+    ├── matcher    → bktree, dihedral
+    ├── pdq_hash   → buffer, buffer_pool, context, error, pipeline, hash_common, pixel_pack (feature: pdq)
     ├── mean_hash  → hash_common (macros)
     ├── median_hash → hash_common (macros)
     ├── gradient_hash → hash_common (macros)
@@ -694,7 +1068,7 @@ lib.rs
     └── double_gradient_hash → hash_common (macros)
 ```
 
-**依赖方向**: 能力层内部单向依赖，业务层依赖能力层，算法间无横向依赖。
+**依赖方向**: 能力层内部单向依赖，业务层依赖能力层，算法间通过 matcher 和 dihedral 有有限横向依赖。
 
 ---
 
@@ -722,6 +1096,15 @@ lib.rs
 5. 在 src/tasks/mod.rs 中导出
 ```
 
+**模式 C: 卷积类算法（如高斯模糊）**
+```
+1. 创建 src/tasks/new_filter.rs
+2. 委托 GpuConvolution 执行，自动生成卷积核
+3. 提供零拷贝接口（*_gpu 方法）支持流水线组合
+4. 在 src/tasks/mod.rs 中导出
+5. 在 src/lib.rs 中重导出公共类型
+```
+
 ### 7.2 WGSL Shader 规范
 
 ```wgsl
@@ -747,12 +1130,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 ```
 
+**Uniform 对齐注意**: WGSL 中 `array<f32, N>` 的 stride 为 4 字节，但 uniform buffer 要求 16 字节对齐。当 uniform 结构体包含大数组时，需确保数组长度满足对齐要求（如 convolution.wgsl 中 kernel 数组填充至 124 个 f32）。
+
 ### 7.3 Workgroup 大小选择
 
 | 场景 | 推荐大小 | 说明 |
 |------|---------|------|
 | 数据并行（SHA-256、感知哈希） | `[256, 1, 1]` | 每条消息/图像一个 work item |
 | 需要共享内存 | `[64, 1, 1]` 或 `[16, 16, 1]` | 减少寄存器压力 |
+| 卷积/DCT | `[256, 1, 1]` | 每个像素一个 work item |
 
 ---
 
@@ -763,6 +1149,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 ```bash
 cargo build                         # 默认构建（无 image feature）
 cargo build --features image        # 启用图像支持
+cargo build --features pdq          # 启用 PDQ 哈希
+cargo build --features cpu-fallback # 启用 CPU 降级实现（默认开启）
 cargo build --release               # 发布构建
 ```
 
@@ -773,6 +1161,7 @@ cargo test                          # 运行所有测试
 cargo test sha256                   # 运行特定测试
 cargo test --test gpu_resize_test   # 运行 GPU 缩放测试
 cargo test --test bktree_test       # 运行 BK-tree 测试
+cargo test --features pdq           # 运行 PDQ 哈希测试
 ```
 
 ### 8.3 基准测试
@@ -816,6 +1205,11 @@ cargo clippy                        # lint 检查
 | HashSize 替代 HashBits | 结构体替代枚举 | 支持任意 2 的幂次网格尺寸，扩展性更好 |
 | PhashParams 扩展为 8 字段 | 32 字节 uniform | 传递 hash_size 到 WGSL，支持动态网格计算 |
 | block_hash 即时计算 block_mean | 函数调用替代大数组 | 避免 DX12 临时寄存器溢出（原 array<u32,4096> 超限） |
+| 卷积核数组填充至 124 f32 | 16 字节对齐 | WGSL uniform buffer 要求 16 字节对齐，kernel 数组 stride 4 不满足要求 |
+| 高斯模糊委托卷积 | 组合优于继承 | GpuGaussianBlur 封装 GpuConvolution，复用可分离卷积逻辑 |
+| 哈希匹配策略模式 | trait + 多实现 | LinearScan/BkTree/Chained 可互换，Facade 封装二面体变换 |
+| PDQ GPU+CPU 混合 | GPU DCT + CPU 量化 | DCT 适合 GPU 并行，中值量化需排序不适合 GPU |
+| pixel_pack 独立模块 | 单一职责 | u8↔u32 转换被多个业务模块复用，独立避免循环依赖 |
 
 ---
 
@@ -829,7 +1223,10 @@ cargo clippy                        # lint 检查
 | GPU 缩放质量 | box filter 适合下采样，上采样质量不如 Lanczos |
 | 分批粒度 | 分批依据 256MB 硬限制，未考虑实际显存容量 |
 | HashSize=64 DX12 限制 | hash_size=64 时部分着色器可能因工作寄存器压力在 DX12 后端编译失败 |
+| convolution.wgsl Uniform 对齐 | kernel 数组 stride 为 4 字节，不满足 WGSL uniform buffer 16 字节对齐要求，当前通过填充至 124 个 f32 规避 |
+| PDQ 哈希需 pdq feature | PDQ 相关功能需 `--features pdq` 显式启用，默认不编译 |
+| HashMatcher 仅支持 64-bit | 当前 HashMatcher 仅支持 u64 (64-bit) 哈希，不支持 256-bit 等更宽哈希 |
 
 ---
 
-*文档生成完毕。基于源码分析，覆盖能力层 6 个模块、业务层 10 个模块的完整架构。*
+*文档生成完毕。基于源码分析，覆盖能力层 7 个模块、业务层 16 个模块的完整架构。*

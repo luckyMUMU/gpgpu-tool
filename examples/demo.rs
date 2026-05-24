@@ -1,4 +1,4 @@
-use wgpu_compute_engine::{GpuContext, tasks::sha256::Sha256Computer};
+use gpgpu_tool::{GpuContext, tasks::sha256::Sha256Computer};
 
 fn main() {
     env_logger::init();

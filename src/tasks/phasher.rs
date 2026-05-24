@@ -9,9 +9,14 @@ use crate::tasks::block_hash::BlockHashComputer;
 use crate::tasks::vert_gradient_hash::VertGradientHashComputer;
 use crate::tasks::double_gradient_hash::DoubleGradientHashComputer;
 use crate::tasks::gpu_resize::{GpuResize, GpuResizeConfig};
+use crate::ComputeBackend;
+#[cfg(feature = "cpu-fallback")]
+use crate::tasks::phasher_cpu::PHasherCpu;
+#[cfg(feature = "pdq")]
+use crate::tasks::pdq_hash::PdqHashGpu;
 
 /// 感知哈希算法类型。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashAlgorithm {
     Mean,
     Median,
@@ -19,6 +24,8 @@ pub enum HashAlgorithm {
     Block,
     VertGradient,
     DoubleGradient,
+    #[cfg(feature = "pdq")]
+    Pdq,
 }
 
 impl HashAlgorithm {
@@ -29,6 +36,8 @@ impl HashAlgorithm {
             HashAlgorithm::Gradient => (s, s + 1),
             HashAlgorithm::VertGradient => (s + 1, s),
             HashAlgorithm::DoubleGradient => (s + 1, s + 1),
+            #[cfg(feature = "pdq")]
+            HashAlgorithm::Pdq => (64, 64),
         }
     }
 }
@@ -41,8 +50,8 @@ impl HashAlgorithm {
 /// # 示例
 ///
 /// ```no_run
-/// use wgpu_compute_engine::GpuContext;
-/// use wgpu_compute_engine::tasks::phasher::{PerceptualHasher, HashAlgorithm};
+/// use gpgpu_tool::GpuContext;
+/// use gpgpu_tool::tasks::phasher::{PerceptualHasher, HashAlgorithm};
 ///
 /// let mut ctx = GpuContext::new_sync().unwrap();
 /// let hasher = PerceptualHasher::new(&mut ctx, HashAlgorithm::Mean).unwrap();
@@ -132,6 +141,10 @@ impl PerceptualHasher {
             HashAlgorithm::Block => Box::new(BlockHashComputer::with_config(ctx, workgroup_size, hash_size)?),
             HashAlgorithm::VertGradient => Box::new(VertGradientHashComputer::with_config(ctx, workgroup_size, hash_size)?),
             HashAlgorithm::DoubleGradient => Box::new(DoubleGradientHashComputer::with_config(ctx, workgroup_size, hash_size)?),
+            #[cfg(feature = "pdq")]
+            HashAlgorithm::Pdq => {
+                Box::new(PdqHashGpu::new(ctx)?)
+            }
         };
         let max_batch_size = gpu_resize_config.max_buffer_size / 2;
         let gpu_resize = if use_gpu_resize {
@@ -181,6 +194,30 @@ impl PerceptualHasher {
             return Ok(vec![]);
         }
 
+        // CPU 降级路径
+        if ctx.backend() == ComputeBackend::Cpu {
+            #[cfg(feature = "cpu-fallback")]
+            {
+                let cpu_hasher = PHasherCpu::with_hash_size(self.algorithm, self.hash_size);
+                let all_target_size = dimensions.iter().all(|&(w, h)| {
+                    w == self.target_width && h == self.target_height
+                });
+                if all_target_size {
+                    return cpu_hasher.compute(images, self.target_width, self.target_height);
+                }
+                let resized: Vec<Vec<u8>> = images
+                    .iter()
+                    .zip(dimensions.iter())
+                    .map(|(pixels, &(w, h))| {
+                        resize_grayscale(pixels, w, h, self.target_width, self.target_height)
+                    })
+                    .collect();
+                return cpu_hasher.compute(&resized, self.target_width, self.target_height);
+            }
+            #[cfg(not(feature = "cpu-fallback"))]
+            return Err(GpuError::CpuFallback("CPU 降级未启用".to_string()));
+        }
+
         // 检查是否所有图像已经是目标尺寸
         let all_target_size = dimensions.iter().all(|&(w, h)| {
             w == self.target_width && h == self.target_height
@@ -195,6 +232,20 @@ impl PerceptualHasher {
 
         if let Some(ref gpu_resize) = self.gpu_resize {
             if all_same_size {
+                // PDQ 使用独立的 DCT 管线，不兼容标准 compute_phash_from_gpu_buffer，
+                // 跳过 GPU 缩放路径，回退到 CPU 缩放 + GPU DCT
+                #[cfg(feature = "pdq")]
+                if self.algorithm == HashAlgorithm::Pdq {
+                    let resized: Vec<Vec<u8>> = images
+                        .iter()
+                        .zip(dimensions.iter())
+                        .map(|(pixels, &(w, h))| {
+                            resize_grayscale(pixels, w, h, self.target_width, self.target_height)
+                        })
+                        .collect();
+                    return self.computer.compute(ctx, &resized);
+                }
+
                 let (src_w, src_h) = dimensions[0];
                 let src_pixels = (src_w * src_h) as usize;
                 let dst_pixels = (self.target_width * self.target_height) as usize;
@@ -250,11 +301,22 @@ impl PerceptualHasher {
     }
 
     /// 对已缩放到目标尺寸的灰度像素数据计算感知哈希（跳过缩放步骤）。
+    ///
+    /// 当 `GpuContext` 处于 CPU 降级模式时，自动委托到 [`PHasherCpu`] 计算。
     pub fn compute_resized(
         &self,
         ctx: &GpuContext,
         images: &[Vec<u8>],
     ) -> Result<Vec<u64>, GpuError> {
+        if ctx.backend() == ComputeBackend::Cpu {
+            #[cfg(feature = "cpu-fallback")]
+            {
+                let cpu_hasher = PHasherCpu::with_hash_size(self.algorithm, self.hash_size);
+                return cpu_hasher.compute(images, self.target_width, self.target_height);
+            }
+            #[cfg(not(feature = "cpu-fallback"))]
+            return Err(GpuError::CpuFallback("CPU 降级未启用".to_string()));
+        }
         self.computer.compute(ctx, images)
     }
 }
@@ -314,6 +376,7 @@ mod image_support {
         /// 从 `image::DynamicImage` 计算感知哈希（需要启用 `image` feature）。
         ///
         /// 内部使用 Lanczos3 高质量缩放。
+        /// 当 `GpuContext` 处于 CPU 降级模式时，自动委托到 [`PHasherCpu`] 计算。
         pub fn compute_images(
             &self,
             ctx: &GpuContext,
@@ -331,6 +394,16 @@ mod image_support {
                     luma.pixels().map(|(_, _, luma)| luma.0[0]).collect()
                 })
                 .collect();
+
+            if ctx.backend() == ComputeBackend::Cpu {
+                #[cfg(feature = "cpu-fallback")]
+                {
+                    let cpu_hasher = PHasherCpu::with_hash_size(self.algorithm, self.hash_size);
+                    return cpu_hasher.compute(&resized, self.target_width, self.target_height);
+                }
+                #[cfg(not(feature = "cpu-fallback"))]
+                return Err(GpuError::CpuFallback("CPU 降级未启用".to_string()));
+            }
 
             self.computer.compute(ctx, &resized)
         }

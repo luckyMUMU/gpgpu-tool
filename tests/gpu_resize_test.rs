@@ -1,6 +1,6 @@
 use image::GenericImageView;
-use wgpu_compute_engine::GpuContext;
-use wgpu_compute_engine::tasks::phasher::{HashAlgorithm, PerceptualHasher};
+use gpgpu_tool::GpuContext;
+use gpgpu_tool::tasks::phasher::{HashAlgorithm, PerceptualHasher};
 
 const DATA_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data");
 

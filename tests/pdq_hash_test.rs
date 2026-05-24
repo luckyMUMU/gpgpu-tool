@@ -1,5 +1,5 @@
 #[cfg(feature = "pdq")]
-use gpgpu_tool::{ComputeBackend, GpuContext};
+use gpgpu_tool::{ComputeBackend, GpuContext, HashSize};
 
 #[cfg(feature = "pdq")]
 use gpgpu_tool::tasks::pdq_hash::{PdqHashCpu, PdqHashGpu};
@@ -100,7 +100,7 @@ fn test_pdq_gpu_basic() {
 
     // 创建 64×64 均匀灰度图像
     let pixels = vec![128u8; 64 * 64];
-    let hashes = gpu.compute(&ctx, &[pixels]).unwrap();
+    let hashes = gpu.compute(&ctx, &[pixels], HashSize::new(16)).unwrap();
     // 每张图输出 4 个 u64
     assert_eq!(hashes.len(), 4, "单张图像应输出 4 个 u64");
 }
@@ -135,7 +135,7 @@ fn test_pdq_gpu_batch() {
         vec![0u8; 64 * 64],
         vec![255u8; 64 * 64],
     ];
-    let hashes = gpu.compute(&ctx, &images).unwrap();
+    let hashes = gpu.compute(&ctx, &images, HashSize::new(16)).unwrap();
     // 3 张图 × 4 u64 = 12
     assert_eq!(hashes.len(), 12, "3 张图像应输出 12 个 u64");
 }
@@ -176,11 +176,43 @@ fn test_pdq_cpu_gpu_consistency() {
         .collect();
 
     let cpu_result = cpu.compute(&pixels).unwrap();
-    let gpu_hashes = gpu.compute(&ctx, &[pixels.clone()]).unwrap();
+    let gpu_hashes = gpu.compute(&ctx, &[pixels.clone()], HashSize::new(16)).unwrap();
 
     let gpu_hash: [u64; 4] = [gpu_hashes[0], gpu_hashes[1], gpu_hashes[2], gpu_hashes[3]];
     assert_eq!(
         cpu_result.hash, gpu_hash,
         "CPU 和 GPU 的 PDQ 哈希应一致"
     );
+}
+
+#[cfg(feature = "pdq")]
+#[test]
+fn test_pdq_gpu_invalid_hash_size() {
+    let mut ctx = match GpuContext::new_sync() {
+        Ok(ctx) => ctx,
+        Err(_) => {
+            eprintln!("GPU 不可用，跳过 PDQ hash_size 验证测试");
+            return;
+        }
+    };
+
+    if ctx.backend() != ComputeBackend::Gpu {
+        eprintln!("非 GPU 模式，跳过 PDQ hash_size 验证测试");
+        return;
+    }
+
+    let gpu = match PdqHashGpu::new(&mut ctx) {
+        Ok(g) => g,
+        Err(_) => {
+            eprintln!("PdqHashGpu 创建失败，跳过");
+            return;
+        }
+    };
+
+    let pixels = vec![128u8; 64 * 64];
+    let result = gpu.compute(&ctx, &[pixels.clone()], HashSize::new(8));
+    assert!(result.is_err(), "hash_size=8 应返回错误，PDQ 固定为 256-bit");
+
+    let result = gpu.compute(&ctx, &[pixels], HashSize::new(32));
+    assert!(result.is_err(), "hash_size=32 应返回错误，PDQ 固定为 256-bit");
 }

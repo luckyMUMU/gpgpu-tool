@@ -110,8 +110,15 @@ impl PdqHashGpu {
     /// 对已缩放到 64×64 的灰度图像批量计算 PDQ 哈希。
     ///
     /// GPU 执行两趟 DCT-II 变换，CPU 完成中值量化和哈希打包。
-    /// 每张图像输出 4 个 u64（256-bit 哈希）。
-    pub fn compute(&self, ctx: &GpuContext, images: &[Vec<u8>]) -> Result<Vec<u64>, GpuError> {
+    /// 每张图像输出 `hash_size.u64s_per_image()` 个 u64（PDQ 固定为 4 个 u64 = 256-bit）。
+    /// 当 `hash_size != 16` 时返回错误，因为 PDQ 算法固定输出 256-bit 哈希。
+    pub fn compute(&self, ctx: &GpuContext, images: &[Vec<u8>], hash_size: HashSize) -> Result<Vec<u64>, GpuError> {
+        if hash_size.size() != 16 {
+            return Err(GpuError::InvalidInput(format!(
+                "PDQ 哈希固定为 16×16=256 bit，不支持 hash_size={}（期望 16）",
+                hash_size.size()
+            )));
+        }
         if images.is_empty() {
             return Ok(vec![]);
         }
@@ -225,16 +232,16 @@ impl PerceptualHashComputer for PdqHashGpu {
         ctx: &GpuContext,
         images: &[Vec<u8>],
     ) -> Result<Vec<u64>, GpuError> {
-        Self::compute(self, ctx, images)
+        self.compute(ctx, images, HashSize::new(16))
     }
 
     fn compute_sized(
         &self,
         ctx: &GpuContext,
         images: &[Vec<u8>],
-        _hash_size: HashSize,
+        hash_size: HashSize,
     ) -> Result<Vec<u64>, GpuError> {
-        Self::compute(self, ctx, images)
+        self.compute(ctx, images, hash_size)
     }
 
     fn pipeline(&self) -> &ComputePipeline {

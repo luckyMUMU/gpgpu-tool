@@ -1,14 +1,49 @@
 use std::sync::Arc;
 
 use crate::buffer::{BufferUsage, GpuBuffer};
-use crate::buffer_pool::BufferPool;
+use crate::buffer_pool::{BufferPool, BufferPoolConfig};
 use crate::context::GpuContext;
 use crate::error::GpuError;
 use crate::pipeline::ComputePipeline;
 
 const RESIZE_WGSL: &str = include_str!("resize.wgsl");
-const DEFAULT_WORKGROUP_SIZE: [u32; 3] = [256, 1, 1];
-const MAX_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
+
+/// GPU 缩放器的默认 workgroup 大小。
+pub const DEFAULT_RESIZE_WORKGROUP_SIZE: [u32; 3] = [256, 1, 1];
+/// GPU 缩放器的默认最大缓冲区大小（256 MB）。
+pub const DEFAULT_MAX_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
+
+/// GPU 图像缩放器配置参数。
+#[derive(Debug, Clone)]
+pub struct GpuResizeConfig {
+    /// 计算 workgroup 大小，默认 [256, 1, 1]。
+    pub workgroup_size: [u32; 3],
+    /// 单次 dispatch 允许的最大缓冲区字节数，超出会拆分为多批次。
+    /// 默认 256 MB。
+    pub max_buffer_size: u64,
+    /// 缓冲区复用池配置。默认使用 `BufferPoolConfig::default()`。
+    pub buffer_pool_config: BufferPoolConfig,
+}
+
+impl Default for GpuResizeConfig {
+    fn default() -> Self {
+        Self {
+            workgroup_size: DEFAULT_RESIZE_WORKGROUP_SIZE,
+            max_buffer_size: DEFAULT_MAX_BUFFER_SIZE,
+            buffer_pool_config: BufferPoolConfig::default(),
+        }
+    }
+}
+
+impl GpuResizeConfig {
+    pub fn new() -> Self { Self::default() }
+    /// 设置 workgroup 大小。
+    pub fn workgroup_size(mut self, v: [u32; 3]) -> Self { self.workgroup_size = v; self }
+    /// 设置单批次最大缓冲大小（字节）。
+    pub fn max_buffer_size(mut self, v: u64) -> Self { self.max_buffer_size = v; self }
+    /// 设置缓冲区池配置。
+    pub fn buffer_pool_config(mut self, v: BufferPoolConfig) -> Self { self.buffer_pool_config = v; self }
+}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -22,23 +57,35 @@ struct ResizeParams {
 pub struct GpuResize {
     pipeline: Arc<ComputePipeline>,
     workgroup_size: [u32; 3],
+    max_buffer_size: u64,
     buffer_pool: BufferPool,
 }
 
 impl GpuResize {
+    /// 创建 GPU 缩放器（默认配置）。
     pub fn new(ctx: &mut GpuContext) -> Result<Self, GpuError> {
-        Self::with_workgroup_size(ctx, DEFAULT_WORKGROUP_SIZE)
+        Self::with_config(ctx, GpuResizeConfig::default())
     }
 
+    /// 创建 GPU 缩放器，指定 workgroup_size。
     pub fn with_workgroup_size(
         ctx: &mut GpuContext,
         workgroup_size: [u32; 3],
     ) -> Result<Self, GpuError> {
-        let pipeline = ctx.get_or_create_pipeline(RESIZE_WGSL, workgroup_size)?;
+        Self::with_config(ctx, GpuResizeConfig::default().workgroup_size(workgroup_size))
+    }
+
+    /// 创建 GPU 缩放器，完整配置。
+    pub fn with_config(
+        ctx: &mut GpuContext,
+        config: GpuResizeConfig,
+    ) -> Result<Self, GpuError> {
+        let pipeline = ctx.get_or_create_pipeline(RESIZE_WGSL, config.workgroup_size)?;
         Ok(Self {
             pipeline,
-            workgroup_size,
-            buffer_pool: BufferPool::new(),
+            workgroup_size: config.workgroup_size,
+            max_buffer_size: config.max_buffer_size,
+            buffer_pool: BufferPool::with_config(config.buffer_pool_config),
         })
     }
 
@@ -76,13 +123,13 @@ impl GpuResize {
             }
         }
 
-        let src_u32_per_image = src_pixels.div_ceil(4) as u64;
+        let src_u32_per_image = src_pixels as u64; // u32-per-pixel
         let dst_pixels = (target_width * target_height) as usize;
         let dst_u32_per_image = dst_pixels as u64;
         let u32_per_image = src_u32_per_image + dst_u32_per_image;
 
         let max_batch = if u32_per_image > 0 {
-            ((MAX_BUFFER_SIZE / 2) / (u32_per_image * 4)).max(1) as usize
+            ((self.max_buffer_size / 2) / (u32_per_image * 4)).max(1) as usize
         } else {
             images.len()
         };
@@ -159,14 +206,14 @@ impl GpuResize {
         let src_pixels = (src_w * src_h) as usize;
         let dst_pixels = (target_width * target_height) as usize;
 
-        let src_u32_per_image = src_pixels.div_ceil(4);
-        let total_src_u32 = image_count * src_u32_per_image;
+        // u32-per-pixel: 每像素一个 u32，1/4 密度但消除 shader 中的除法/取模
+        let total_src_u32 = image_count * src_pixels;
         let mut all_pixels: Vec<u32> = vec![0u32; total_src_u32];
         for (img_idx, img) in images.iter().enumerate() {
-            let dst_slice = &mut all_pixels[img_idx * src_u32_per_image..(img_idx + 1) * src_u32_per_image];
-            let dst_bytes = bytemuck::cast_slice_mut::<u32, u8>(dst_slice);
-            let copy_len = img.len().min(dst_bytes.len());
-            dst_bytes[..copy_len].copy_from_slice(&img[..copy_len]);
+            let start = img_idx * src_pixels;
+            for (i, &pixel) in img.iter().enumerate() {
+                all_pixels[start + i] = pixel as u32;
+            }
         }
 
         let input_size = (all_pixels.len() * 4) as u64;
@@ -205,7 +252,7 @@ impl GpuResize {
             [dispatch_x, 1, 1],
         );
 
-        self.buffer_pool.release(input_buffer.into_raw());
+        self.buffer_pool.release(input_buffer.into_raw(), BufferUsage::Storage);
 
         Ok((output_buffer, output_u32_count))
     }
@@ -225,14 +272,14 @@ impl GpuResize {
         let src_pixels = (src_w * src_h) as usize;
         let dst_pixels = (target_width * target_height) as usize;
 
-        let src_u32_per_image = src_pixels.div_ceil(4);
-        let total_src_u32 = image_count * src_u32_per_image;
+        // u32-per-pixel
+        let total_src_u32 = image_count * src_pixels;
         let mut all_pixels: Vec<u32> = vec![0u32; total_src_u32];
         for (img_idx, img) in images.iter().enumerate() {
-            let dst_slice = &mut all_pixels[img_idx * src_u32_per_image..(img_idx + 1) * src_u32_per_image];
-            let dst_bytes = bytemuck::cast_slice_mut::<u32, u8>(dst_slice);
-            let copy_len = img.len().min(dst_bytes.len());
-            dst_bytes[..copy_len].copy_from_slice(&img[..copy_len]);
+            let start = img_idx * src_pixels;
+            for (i, &pixel) in img.iter().enumerate() {
+                all_pixels[start + i] = pixel as u32;
+            }
         }
 
         let input_size = (all_pixels.len() * 4) as u64;
@@ -273,8 +320,8 @@ impl GpuResize {
 
         let result = output_buffer.download_with_pool(device, queue, &self.buffer_pool)?;
 
-        self.buffer_pool.release(input_buffer.into_raw());
-        self.buffer_pool.release(output_buffer.into_raw());
+        self.buffer_pool.release(input_buffer.into_raw(), BufferUsage::Storage);
+        self.buffer_pool.release(output_buffer.into_raw(), BufferUsage::Storage);
 
         let raw_u32 = bytemuck::cast_slice::<u8, u32>(&result);
         let mut resized_images = Vec::with_capacity(image_count);

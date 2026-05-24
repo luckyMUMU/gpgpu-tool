@@ -124,28 +124,37 @@ impl GpuBatchSubmitter {
         // 等待 GPU 完成
         device.poll(wgpu::Maintain::Wait);
 
-        // 映射 staging buffer 读取结果
+        // 映射 staging buffer 读取结果（使用 channel 验证映射成功）
         let mut results = Vec::with_capacity(self.pending.len());
+        let mut map_rxs: Vec<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>> =
+            Vec::with_capacity(self.pending.len());
 
         for pending in &self.pending {
-            pending
-                .staging_buffer
-                .slice(..)
-                .map_async(wgpu::MapMode::Read, |result| {
-                    if let Err(e) = result {
-                        log::error!("批量 staging buffer 映射失败: {}", e);
-                    }
-                });
+            let (tx, rx) = std::sync::mpsc::channel();
+            pending.staging_buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                tx.send(r).ok();
+            });
+            map_rxs.push(rx);
         }
 
         device.poll(wgpu::Maintain::Wait);
+
+        // 验证所有映射成功
+        for rx in &map_rxs {
+            match rx
+                .recv()
+                .map_err(|_| GpuError::MapFailed("批量映射通道关闭".into()))?
+            {
+                Ok(()) => {}
+                Err(e) => return Err(GpuError::MapFailed(format!("批量映射失败: {}", e))),
+            }
+        }
 
         for pending in self.pending.drain(..) {
             let view = pending.staging_buffer.slice(..).get_mapped_range();
             let data = view.to_vec();
             drop(view);
             pending.staging_buffer.unmap();
-
             results.push(data);
         }
 

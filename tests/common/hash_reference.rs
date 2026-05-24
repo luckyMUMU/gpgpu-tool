@@ -146,7 +146,7 @@ pub fn block_hash(pixels: &[u8], width: u32, height: u32) -> u64 {
         if bit_pos >= 64 {
             break;
         }
-        let idx = (0 * blocks_x + bx) as usize;
+        let idx = bx as usize;
         let current = block_means[idx];
         let below = block_means[idx + blocks_x as usize];
         if below > current {
@@ -156,6 +156,76 @@ pub fn block_hash(pixels: &[u8], width: u32, height: u32) -> u64 {
     }
 
     hash
+}
+
+pub fn block_hash_with_size(pixels: &[u8], width: u32, height: u32, hash_size: u32) -> Vec<u64> {
+    let blocks_x = hash_size;
+    let blocks_y = hash_size;
+    let block_w = width / blocks_x;
+    let block_h = height / blocks_y;
+    let total_bits = hash_size * hash_size;
+    let u32s_per_image = total_bits.div_ceil(32);
+    let u64s_per_image = u32s_per_image.div_ceil(2);
+
+    let mut block_means = Vec::with_capacity((blocks_x * blocks_y) as usize);
+    for by in 0..blocks_y {
+        for bx in 0..blocks_x {
+            let mut sum: u32 = 0;
+            for dy in 0..block_h {
+                for dx in 0..block_w {
+                    let px = bx * block_w + dx;
+                    let py = by * block_h + dy;
+                    let idx = (py * width + px) as usize;
+                    sum += pixels[idx] as u32;
+                }
+            }
+            let mean = sum / (block_w * block_h);
+            block_means.push(mean);
+        }
+    }
+
+    let mut hash_u32s = vec![0u32; u32s_per_image as usize];
+    let mut bit_pos: u32 = 0;
+
+    for by in 0..blocks_y {
+        for bx in 0..(blocks_x - 1) {
+            if bit_pos >= total_bits { break; }
+            let idx = (by * blocks_x + bx) as usize;
+            let current = block_means[idx];
+            let next = block_means[idx + 1];
+            if next > current {
+                let u32_idx = (bit_pos / 32) as usize;
+                hash_u32s[u32_idx] |= 1u32 << (bit_pos % 32);
+            }
+            bit_pos += 1;
+        }
+    }
+
+    for by in 0..(blocks_y - 1) {
+        for bx in 0..blocks_x {
+            if bit_pos >= total_bits { break; }
+            let idx = (by * blocks_x + bx) as usize;
+            let current = block_means[idx];
+            let below = block_means[idx + blocks_x as usize];
+            if below > current {
+                let u32_idx = (bit_pos / 32) as usize;
+                hash_u32s[u32_idx] |= 1u32 << (bit_pos % 32);
+            }
+            bit_pos += 1;
+        }
+    }
+
+    let mut result = Vec::with_capacity(u64s_per_image as usize);
+    for u64_idx in 0..u64s_per_image {
+        let lo = hash_u32s[u64_idx as usize * 2];
+        let hi = if u64_idx as usize * 2 + 1 < u32s_per_image as usize {
+            hash_u32s[u64_idx as usize * 2 + 1]
+        } else {
+            0u32
+        };
+        result.push((lo as u64) | ((hi as u64) << 32));
+    }
+    result
 }
 
 /// Double Gradient Hash（双梯度哈希）CPU 参考实现。

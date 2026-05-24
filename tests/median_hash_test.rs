@@ -1,5 +1,5 @@
 use wgpu_compute_engine::{
-    tasks::hash_common::PerceptualHashComputer,
+    tasks::hash_common::{HashSize, PerceptualHashComputer},
     tasks::median_hash::MedianHashComputer,
     GpuContext,
 };
@@ -27,7 +27,6 @@ fn test_median_hash_single_8x8() {
 }
 
 #[test]
-#[ignore]
 fn test_median_hash_single_16x16() {
     let mut ctx = match GpuContext::new_sync() {
         Ok(ctx) => ctx,
@@ -36,7 +35,7 @@ fn test_median_hash_single_16x16() {
             return;
         }
     };
-    let hasher = MedianHashComputer::new(&mut ctx).expect("创建失败");
+    let hasher = MedianHashComputer::with_config(&mut ctx, [256, 1, 1], HashSize::new(16)).expect("创建失败");
 
     let image = test_data::gradient_image(256);
     let gpu_hash = hasher.compute(&ctx, &[image.clone()]).expect("计算失败")[0];

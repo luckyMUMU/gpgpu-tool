@@ -2,44 +2,51 @@
 
 @group(0) @binding(1) var<storage, read_write> hashes: array<u32>;
 
-@group(0) @binding(2) var<uniform> params: vec4<u32>;
+struct Params {
+    image_count: u32,
+    width: u32,
+    height: u32,
+    hash_size_bits: u32,
+    hash_size: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
+};
+
+@group(0) @binding(2) var<uniform> params: Params;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let img_idx = gid.x;
-    let image_count = params.x;
+    let image_count = params.image_count;
+    if (img_idx >= image_count) { return; }
 
-    if (img_idx >= image_count) {
-        return;
-    }
-
-    let width = params.y;
-    let height = params.z;
+    let width = params.width;
+    let height = params.height;
+    let hash_bits = params.hash_size_bits;
+    let u32s_per_image = (hash_bits + 31u) / 32u;
     let pixels_per_image = width * height;
     let base = img_idx * pixels_per_image;
 
-    // 水平梯度：每行相邻像素比较，使用独立 bit_pos 避免信息丢失
-    var hash_low: u32 = 0u;
-    var hash_high: u32 = 0u;
+    var hash_u32s: array<u32, 128>;
+    for (var u = 0u; u < u32s_per_image; u = u + 1u) { hash_u32s[u] = 0u; }
     var bit_pos: u32 = 0u;
 
     for (var row = 0u; row < height; row = row + 1u) {
         for (var col = 0u; col < width - 1u; col = col + 1u) {
+            if (bit_pos >= hash_bits) { break; }
             let idx = row * width + col;
-            let left = pixels[base + idx];
-            let right = pixels[base + idx + 1u];
-            let bit = select(0u, 1u, right > left);
-
-            if (bit_pos < 32u) {
-                hash_low = hash_low | (bit << bit_pos);
-            } else if (bit_pos < 64u) {
-                hash_high = hash_high | (bit << (bit_pos - 32u));
-            }
+            let current = pixels[base + idx];
+            let next = pixels[base + idx + 1u];
+            let bit = select(0u, 1u, next > current);
+            let u32_idx = bit_pos / 32u;
+            hash_u32s[u32_idx] = hash_u32s[u32_idx] | (bit << (bit_pos % 32u));
             bit_pos = bit_pos + 1u;
         }
     }
 
-    let out_base = img_idx * 2u;
-    hashes[out_base + 0u] = hash_low;
-    hashes[out_base + 1u] = hash_high;
+    let out_base = img_idx * u32s_per_image;
+    for (var u = 0u; u < u32s_per_image; u = u + 1u) {
+        hashes[out_base + u] = hash_u32s[u];
+    }
 }

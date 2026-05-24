@@ -70,6 +70,7 @@ fn fxhash(s: &str) -> u64 {
 /// println!("适配器: {}", ctx.adapter_info());
 /// ```
 pub struct GpuContext {
+    /// wgpu 要求 Instance 生命周期覆盖所有 GPU 资源，仅用于保活，不直接读取。
     _instance: Instance,
     adapter: Adapter,
     device: Device,

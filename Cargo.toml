@@ -1,6 +1,6 @@
 [package]
 name = "wgpu-compute-engine"
-version = "0.1.0"
+version = "0.2.0"
 description = "跨平台 GPU 并行加速引擎，基于 wgpu。提供 SHA-256、感知哈希、BK-tree 相似度搜索等开箱即用的 GPU 计算能力。"
 edition = "2021"
 license = "MIT"

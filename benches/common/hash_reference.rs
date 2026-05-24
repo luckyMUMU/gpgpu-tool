@@ -1,17 +1,18 @@
 /// CPU 参考实现：6 种感知哈希算法（基准测试专用）。
 ///
 /// 与 WGSL 实现保持一致的 bit 映射策略（独立 bit_pos 计数器）。
-/// 支持可变 width/height 参数。
+/// 与 GPU WGSL 算法完全对齐：f32 均值 + >= 比较（mean），直方图中值（median）。
 
 /// Mean Hash（均值哈希）CPU 参考实现。
+/// 使用 f32 均值（与 GPU WGSL 一致），像素 >= 均值生成 1bit。
 pub fn mean_hash(pixels: &[u8], _width: u32, _height: u32) -> u64 {
     let count = pixels.len().min(64);
-    let sum: u32 = pixels[..count].iter().map(|&p| p as u32).sum();
-    let mean = sum / count as u32;
+    let sum: f32 = pixels[..count].iter().map(|&p| p as f32).sum();
+    let mean = sum / count as f32;
 
     let mut hash: u64 = 0;
     for (i, &pixel) in pixels[..count].iter().enumerate() {
-        if pixel as u32 > mean {
+        if pixel as f32 >= mean {
             hash |= 1u64 << i;
         }
     }
@@ -19,15 +20,27 @@ pub fn mean_hash(pixels: &[u8], _width: u32, _height: u32) -> u64 {
 }
 
 /// Median Hash（中值哈希）CPU 参考实现。
+/// 使用直方图中值算法（与 GPU WGSL 一致），像素 > 中值生成 1bit。
 pub fn median_hash(pixels: &[u8], _width: u32, _height: u32) -> u64 {
     let count = pixels.len().min(64);
-    let mut sorted: Vec<u8> = pixels[..count].to_vec();
-    sorted.sort_unstable();
-    let median = sorted[count / 2];
+    let mut histogram = [0u32; 256];
+    for &pixel in &pixels[..count] {
+        histogram[pixel as usize] += 1;
+    }
+    let half = count as u32 / 2;
+    let mut cum = 0u32;
+    let mut median = 128u32;
+    for v in 0..256u32 {
+        cum += histogram[v as usize];
+        if cum > half {
+            median = v;
+            break;
+        }
+    }
 
     let mut hash: u64 = 0;
     for (i, &pixel) in pixels[..count].iter().enumerate() {
-        if pixel > median {
+        if pixel as u32 > median {
             hash |= 1u64 << i;
         }
     }

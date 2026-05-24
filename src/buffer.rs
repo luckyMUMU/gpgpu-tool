@@ -126,7 +126,10 @@ impl GpuBuffer {
 
         device.poll(wgpu::Maintain::Wait);
 
-        match receiver.recv().unwrap() {
+        match receiver
+            .recv()
+            .map_err(|_| GpuError::MapFailed("异步映射通道关闭，GPU 设备可能已丢失".into()))?
+        {
             Ok(()) => {
                 let view = staging.slice(..).get_mapped_range();
                 let result = view.to_vec();
@@ -160,7 +163,10 @@ impl GpuBuffer {
 
         device.poll(wgpu::Maintain::Wait);
 
-        let result = match receiver.recv().unwrap() {
+        let result = match receiver
+            .recv()
+            .map_err(|_| GpuError::MapFailed("异步映射通道关闭，GPU 设备可能已丢失".into()))?
+        {
             Ok(()) => {
                 let view = staging.slice(..).get_mapped_range();
                 let data = view.to_vec();
@@ -180,18 +186,18 @@ impl GpuBuffer {
         self.size
     }
 
-    #[doc(hidden)]
-    pub fn from_raw(buffer: Buffer, size: u64) -> Self {
+    /// 从原始 wgpu Buffer 创建 GpuBuffer（仅 crate 内部使用）。
+    pub(crate) fn from_raw(buffer: Buffer, size: u64) -> Self {
         Self { buffer, size }
     }
 
-    #[doc(hidden)]
-    pub fn into_raw(self) -> Buffer {
+    /// 取出内部 wgpu Buffer 并消耗 GpuBuffer（仅 crate 内部使用，配合 BufferPool）。
+    pub(crate) fn into_raw(self) -> Buffer {
         self.buffer
     }
 
-    #[doc(hidden)]
-    pub fn raw(&self) -> &Buffer {
+    /// 获取内部 wgpu Buffer 引用（仅 crate 内部使用）。
+    pub(crate) fn raw(&self) -> &Buffer {
         &self.buffer
     }
 }

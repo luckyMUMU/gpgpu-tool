@@ -1,5 +1,5 @@
 use wgpu_compute_engine::{
-    tasks::hash_common::PerceptualHashComputer,
+    tasks::hash_common::{HashSize, PerceptualHashComputer},
     tasks::mean_hash::MeanHashComputer,
     GpuContext,
 };
@@ -34,7 +34,6 @@ fn test_mean_hash_single_8x8() {
 }
 
 #[test]
-#[ignore]
 fn test_mean_hash_single_16x16() {
     let mut ctx = match GpuContext::new_sync() {
         Ok(ctx) => ctx,
@@ -43,7 +42,7 @@ fn test_mean_hash_single_16x16() {
             return;
         }
     };
-    let hasher = MeanHashComputer::new(&mut ctx).expect("创建失败");
+    let hasher = MeanHashComputer::with_config(&mut ctx, [256, 1, 1], HashSize::new(16)).expect("创建失败");
 
     let image = test_data::gradient_image(256);
     let gpu_hash = hasher.compute(&ctx, &[image.clone()]).expect("计算失败")[0];
@@ -102,35 +101,35 @@ fn test_mean_hash_full_report() {
     let gpu_info = get_gpu_info(&ctx);
     let mut report = TestReport::new(gpu_info);
 
-    let hasher = MeanHashComputer::new(&mut ctx).expect("创建失败");
-
-    // 功能测试
     let sizes = vec![(8, 8), (16, 16), (32, 32)];
     for (w, h) in &sizes {
         let size = format!("{}x{}", w, h);
+        let hash_size = HashSize::new(*w);
+        let hasher = MeanHashComputer::with_config(&mut ctx, [256, 1, 1], hash_size).expect("创建失败");
         let image = test_data::gradient_image((w * h) as usize);
         let gpu_hash = hasher.compute(&ctx, &[image.clone()]).expect("计算失败")[0];
         let cpu_hash = hash_reference::mean_hash(&image, *w, *h);
         report.add_test_result("Mean", &size, "single", gpu_hash == cpu_hash);
     }
 
-    // 批量测试
+    let hasher_8 = MeanHashComputer::new(&mut ctx).expect("创建失败");
+
     let batch_images: Vec<Vec<u8>> = (0..10)
         .map(|_| test_data::random_image(64))
         .collect();
-    let gpu_hashes = hasher.compute(&ctx, &batch_images).expect("计算失败");
+    let gpu_hashes = hasher_8.compute(&ctx, &batch_images).expect("计算失败");
     let all_match = batch_images.iter().enumerate().all(|(i, img)| {
         gpu_hashes[i] == hash_reference::mean_hash(img, 8, 8)
     });
     report.add_test_result("Mean", "8x8", "batch", all_match);
 
-    // 空输入测试
-    let empty_result = hasher.compute(&ctx, &[]).expect("计算失败");
+    let empty_result = hasher_8.compute(&ctx, &[]).expect("计算失败");
     report.add_test_result("Mean", "8x8", "empty", empty_result.is_empty());
 
-    // 性能基准
     for (w, h) in &[(8u32, 8u32), (16, 16), (32, 32)] {
         let size = format!("{}x{}", w, h);
+        let hash_size = HashSize::new(*w);
+        let hasher = MeanHashComputer::with_config(&mut ctx, [256, 1, 1], hash_size).expect("创建失败");
         let image = test_data::random_image((w * h) as usize);
         let batch: Vec<Vec<u8>> = (0..100).map(|_| image.clone()).collect();
 

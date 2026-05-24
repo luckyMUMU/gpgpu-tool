@@ -1,5 +1,5 @@
 use wgpu_compute_engine::{
-    tasks::hash_common::PerceptualHashComputer,
+    tasks::hash_common::{HashSize, PerceptualHashComputer},
     tasks::vert_gradient_hash::VertGradientHashComputer,
     GpuContext,
 };
@@ -27,7 +27,6 @@ fn test_vert_gradient_hash_single_9x8() {
 }
 
 #[test]
-#[ignore]
 fn test_vert_gradient_hash_single_17x16() {
     let mut ctx = match GpuContext::new_sync() {
         Ok(ctx) => ctx,
@@ -36,7 +35,7 @@ fn test_vert_gradient_hash_single_17x16() {
             return;
         }
     };
-    let hasher = VertGradientHashComputer::new(&mut ctx).expect("创建失败");
+    let hasher = VertGradientHashComputer::with_config(&mut ctx, [256, 1, 1], HashSize::new(16)).expect("创建失败");
 
     let image = test_data::vertical_gradient_image(17, 16);
     let gpu_hash = hasher.compute(&ctx, &[image.clone()]).expect("计算失败")[0];

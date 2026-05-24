@@ -13,6 +13,7 @@
 //! | [`GpuContext`] | GPU 上下文（设备/队列/管线缓存），所有 GPU 操作入口 |
 //! | [`GpuBuffer`] | CPU-GPU 数据传输缓冲区 |
 //! | [`BufferPool`] | 按尺寸分档的缓冲区复用池 |
+//! | [`BufferPoolConfig`] | 缓冲区池配置（分档基数、容量、释放阈值） |
 //! | [`ComputePipeline`] | 计算管线创建与 dispatch |
 //! | [`GpuBatchSubmitter`] | 异步批量提交，合并多次 dispatch 为一次 GPU 提交 |
 //! | [`GpuError`] | 统一错误类型 |
@@ -57,6 +58,24 @@
 //! let images = vec![vec![128u8; 256 * 256]];
 //! let dimensions = vec![(256u32, 256u32)];
 //! let hashes = hasher.compute(&ctx, &images, &dimensions).unwrap();
+//! ```
+//!
+//! ### 自定义哈希位数
+//!
+//! ```no_run
+//! use wgpu_compute_engine::{GpuContext, tasks::phasher::{PerceptualHasher, HashAlgorithm}, HashSize};
+//!
+//! let mut ctx = GpuContext::new_sync().unwrap();
+//!
+//! // 16x16 网格 → 256 bit 哈希
+//! let hasher = PerceptualHasher::with_hash_size(
+//!     &mut ctx, HashAlgorithm::Mean, HashSize::new(16),
+//! ).unwrap();
+//!
+//! // 32x32 网格 → 1024 bit 哈希
+//! let hasher = PerceptualHasher::with_hash_size(
+//!     &mut ctx, HashAlgorithm::Block, HashSize::new(32),
+//! ).unwrap();
 //! ```
 //!
 //! ### BK-tree 近似图像检索
@@ -131,6 +150,9 @@ pub use buffer::BufferUsage;
 /// 按尺寸分档的 GPU 缓冲区复用池，减少重复分配开销。
 pub use buffer_pool::BufferPool;
 
+/// 缓冲区复用池配置参数。
+pub use buffer_pool::BufferPoolConfig;
+
 /// 计算管线，封装 WGSL 着色器的编译、绑定组创建和 dispatch 调度。
 pub use pipeline::ComputePipeline;
 
@@ -142,6 +164,8 @@ pub use batch::BatchJob;
 
 /// 统一的 GPU 计算错误类型。
 pub use error::GpuError;
+
+pub use tasks::hash_common::HashSize;
 
 // ── 内部辅助重导出（doc(hidden) 但不破坏外部测试兼容性）───────
 // 以下内容对库使用者不可见，但外部集成测试和基准测试仍可访问。

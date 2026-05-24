@@ -108,3 +108,4 @@ fn test_sha256_1kb() {
     let expected = hasher.finalize();
     assert_eq!(result[0].as_slice(), expected.as_slice());
 }
+

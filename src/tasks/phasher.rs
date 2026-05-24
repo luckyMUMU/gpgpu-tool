@@ -1,13 +1,14 @@
+use crate::buffer::BufferUsage;
 use crate::context::GpuContext;
 use crate::error::GpuError;
-use crate::tasks::hash_common::{PerceptualHashComputer, compute_phash_from_gpu_buffer};
+use crate::tasks::hash_common::{HashSize, PerceptualHashComputer, compute_phash_from_gpu_buffer};
 use crate::tasks::mean_hash::MeanHashComputer;
 use crate::tasks::median_hash::MedianHashComputer;
 use crate::tasks::gradient_hash::GradientHashComputer;
 use crate::tasks::block_hash::BlockHashComputer;
 use crate::tasks::vert_gradient_hash::VertGradientHashComputer;
 use crate::tasks::double_gradient_hash::DoubleGradientHashComputer;
-use crate::tasks::gpu_resize::GpuResize;
+use crate::tasks::gpu_resize::{GpuResize, GpuResizeConfig};
 
 /// 感知哈希算法类型。
 #[derive(Debug, Clone, Copy)]
@@ -21,14 +22,13 @@ pub enum HashAlgorithm {
 }
 
 impl HashAlgorithm {
-    /// 返回算法的目标缩放尺寸 (width, height)。
-    pub fn target_size(&self) -> (u32, u32) {
+    pub fn target_size_for(&self, hash_size: HashSize) -> (u32, u32) {
+        let s = hash_size.size();
         match self {
-            HashAlgorithm::Mean | HashAlgorithm::Median => (8, 8),
-            HashAlgorithm::Gradient => (8, 9),
-            HashAlgorithm::Block => (16, 16),
-            HashAlgorithm::VertGradient => (9, 8),
-            HashAlgorithm::DoubleGradient => (9, 9),
+            HashAlgorithm::Mean | HashAlgorithm::Median | HashAlgorithm::Block => (s, s),
+            HashAlgorithm::Gradient => (s, s + 1),
+            HashAlgorithm::VertGradient => (s + 1, s),
+            HashAlgorithm::DoubleGradient => (s + 1, s + 1),
         }
     }
 }
@@ -58,34 +58,84 @@ pub struct PerceptualHasher {
     target_height: u32,
     computer: Box<dyn PerceptualHashComputer>,
     gpu_resize: Option<GpuResize>,
+    hash_size: HashSize,
+    max_batch_size: u64,
 }
 
+/// 感知哈希计算器的默认 workgroup 大小。
+pub const DEFAULT_WORKGROUP_SIZE: [u32; 3] = [256, 1, 1];
+/// 感知哈希批次处理默认最大缓冲区字节数（128 MB）。
+pub const DEFAULT_MAX_BATCH_SIZE: u64 = 128 * 1024 * 1024;
+
 impl PerceptualHasher {
-    /// 创建感知哈希计算器（使用 CPU 缩放）。
+    /// 创建感知哈希计算器（默认 64bit，CPU 缩放，默认 workgroup_size）。
     pub fn new(ctx: &mut GpuContext, algorithm: HashAlgorithm) -> Result<Self, GpuError> {
-        Self::with_resize_mode(ctx, algorithm, false)
+        Self::with_full_config(ctx, algorithm, false, HashSize::default(), DEFAULT_WORKGROUP_SIZE)
     }
 
-    /// 创建感知哈希计算器，指定是否使用 GPU 缩放。
-    ///
-    /// `use_gpu_resize = true` 时，图像缩放将在 GPU 上通过 compute shader 完成，
-    /// 适合大批量大图场景，可显著减少 CPU 负载。
+    /// 创建感知哈希计算器，指定哈希位长和是否 GPU 缩放。
     pub fn with_resize_mode(
         ctx: &mut GpuContext,
         algorithm: HashAlgorithm,
         use_gpu_resize: bool,
     ) -> Result<Self, GpuError> {
-        let (w, h) = algorithm.target_size();
+        Self::with_full_config(ctx, algorithm, use_gpu_resize, HashSize::default(), DEFAULT_WORKGROUP_SIZE)
+    }
+
+    /// 创建感知哈希计算器，指定 hash_size（CPU 缩放，默认 workgroup_size）。
+    pub fn with_hash_size(
+        ctx: &mut GpuContext,
+        algorithm: HashAlgorithm,
+        hash_size: HashSize,
+    ) -> Result<Self, GpuError> {
+        Self::with_full_config(ctx, algorithm, false, hash_size, DEFAULT_WORKGROUP_SIZE)
+    }
+
+    /// 创建感知哈希计算器，完整配置（所有参数均可定制）。
+    pub fn with_config(
+        ctx: &mut GpuContext,
+        algorithm: HashAlgorithm,
+        use_gpu_resize: bool,
+        hash_size: HashSize,
+    ) -> Result<Self, GpuError> {
+        Self::with_full_config(ctx, algorithm, use_gpu_resize, hash_size, DEFAULT_WORKGROUP_SIZE)
+    }
+
+    /// 创建感知哈希计算器，完整配置（包含 workgroup_size）。
+    pub fn with_full_config(
+        ctx: &mut GpuContext,
+        algorithm: HashAlgorithm,
+        use_gpu_resize: bool,
+        hash_size: HashSize,
+        workgroup_size: [u32; 3],
+    ) -> Result<Self, GpuError> {
+        Self::with_full_config_and_gpu_resize(ctx, algorithm, use_gpu_resize, hash_size, workgroup_size, GpuResizeConfig::default())
+    }
+
+    /// 创建感知哈希计算器，完全自定义配置。
+    ///
+    /// 允许同时指定 workgroup_size、hash_size 和 GpuResizeConfig。
+    /// 如果 `use_gpu_resize` 为 true，`gpu_resize_config` 决定 GPU 缩放器的行为。
+    pub fn with_full_config_and_gpu_resize(
+        ctx: &mut GpuContext,
+        algorithm: HashAlgorithm,
+        use_gpu_resize: bool,
+        hash_size: HashSize,
+        workgroup_size: [u32; 3],
+        gpu_resize_config: GpuResizeConfig,
+    ) -> Result<Self, GpuError> {
+        let (w, h) = algorithm.target_size_for(hash_size);
         let computer: Box<dyn PerceptualHashComputer> = match algorithm {
-            HashAlgorithm::Mean => Box::new(MeanHashComputer::new(ctx)?),
-            HashAlgorithm::Median => Box::new(MedianHashComputer::new(ctx)?),
-            HashAlgorithm::Gradient => Box::new(GradientHashComputer::new(ctx)?),
-            HashAlgorithm::Block => Box::new(BlockHashComputer::new(ctx)?),
-            HashAlgorithm::VertGradient => Box::new(VertGradientHashComputer::new(ctx)?),
-            HashAlgorithm::DoubleGradient => Box::new(DoubleGradientHashComputer::new(ctx)?),
+            HashAlgorithm::Mean => Box::new(MeanHashComputer::with_config(ctx, workgroup_size, hash_size)?),
+            HashAlgorithm::Median => Box::new(MedianHashComputer::with_config(ctx, workgroup_size, hash_size)?),
+            HashAlgorithm::Gradient => Box::new(GradientHashComputer::with_config(ctx, workgroup_size, hash_size)?),
+            HashAlgorithm::Block => Box::new(BlockHashComputer::with_config(ctx, workgroup_size, hash_size)?),
+            HashAlgorithm::VertGradient => Box::new(VertGradientHashComputer::with_config(ctx, workgroup_size, hash_size)?),
+            HashAlgorithm::DoubleGradient => Box::new(DoubleGradientHashComputer::with_config(ctx, workgroup_size, hash_size)?),
         };
+        let max_batch_size = gpu_resize_config.max_buffer_size / 2;
         let gpu_resize = if use_gpu_resize {
-            Some(GpuResize::new(ctx)?)
+            Some(GpuResize::with_config(ctx, gpu_resize_config)?)
         } else {
             None
         };
@@ -95,18 +145,17 @@ impl PerceptualHasher {
             target_height: h,
             computer,
             gpu_resize,
+            hash_size,
+            max_batch_size,
         })
     }
 
+    /// 返回哈希位长配置。
+    pub fn hash_size(&self) -> HashSize { self.hash_size }
     /// 返回算法类型。
-    pub fn algorithm(&self) -> HashAlgorithm {
-        self.algorithm
-    }
-
+    pub fn algorithm(&self) -> HashAlgorithm { self.algorithm }
     /// 返回目标缩放尺寸。
-    pub fn target_size(&self) -> (u32, u32) {
-        (self.target_width, self.target_height)
-    }
+    pub fn target_size(&self) -> (u32, u32) { (self.target_width, self.target_height) }
 
     /// 对任意尺寸的灰度像素数据计算感知哈希。
     ///
@@ -149,11 +198,11 @@ impl PerceptualHasher {
                 let (src_w, src_h) = dimensions[0];
                 let src_pixels = (src_w * src_h) as usize;
                 let dst_pixels = (self.target_width * self.target_height) as usize;
-                let src_u32_per_image = src_pixels.div_ceil(4) as u64;
+                let src_u32_per_image = src_pixels as u64; // u32-per-pixel
                 let dst_u32_per_image = dst_pixels as u64;
                 let u32_per_image = src_u32_per_image + dst_u32_per_image;
                 let max_batch = if u32_per_image > 0 {
-                    ((256 * 1024 * 1024 / 2) / (u32_per_image * 4)).max(1) as usize
+                    (self.max_batch_size / (u32_per_image * 4)).max(1) as usize
                 } else {
                     images.len()
                 };
@@ -181,8 +230,9 @@ impl PerceptualHasher {
                         self.target_height,
                         self.computer.workgroup_size(),
                         gpu_resize.buffer_pool(),
+                        self.hash_size,
                     )?;
-                    gpu_resize.buffer_pool().release(resized_buffer.into_raw());
+                    gpu_resize.buffer_pool().release(resized_buffer.into_raw(), BufferUsage::Storage);
                     all_hashes.extend(hashes);
                 }
                 return Ok(all_hashes);

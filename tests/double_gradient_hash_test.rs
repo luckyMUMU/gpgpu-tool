@@ -1,5 +1,5 @@
 use wgpu_compute_engine::{
-    tasks::hash_common::PerceptualHashComputer,
+    tasks::hash_common::{HashSize, PerceptualHashComputer},
     tasks::double_gradient_hash::DoubleGradientHashComputer,
     GpuContext,
 };
@@ -27,7 +27,7 @@ fn test_double_gradient_hash_single_9x9() {
 }
 
 #[test]
-fn test_double_gradient_hash_single_17x17() {
+fn test_double_gradient_hash_single_16x16() {
     let mut ctx = match GpuContext::new_sync() {
         Ok(ctx) => ctx,
         Err(_) => {
@@ -35,13 +35,13 @@ fn test_double_gradient_hash_single_17x17() {
             return;
         }
     };
-    let hasher = DoubleGradientHashComputer::new(&mut ctx).expect("创建失败");
+    let hasher = DoubleGradientHashComputer::with_config(&mut ctx, [256, 1, 1], HashSize::new(16)).expect("创建失败");
 
-    let image = test_data::gradient_image(289);
+    let image = test_data::gradient_image(256);
     let gpu_hash = hasher.compute(&ctx, &[image.clone()]).expect("计算失败")[0];
-    let cpu_hash = hash_reference::double_gradient_hash(&image, 17, 17);
+    let cpu_hash = hash_reference::double_gradient_hash(&image, 16, 16);
 
-    assert_eq!(gpu_hash, cpu_hash, "Double Gradient Hash 17x17 单图像测试失败");
+    assert_eq!(gpu_hash, cpu_hash, "Double Gradient Hash 16x16 单图像测试失败");
 }
 
 #[test]

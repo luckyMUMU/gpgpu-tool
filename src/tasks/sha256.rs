@@ -5,13 +5,16 @@ use std::sync::Arc;
 use bytemuck::{Pod, Zeroable};
 
 use crate::buffer::{BufferUsage, GpuBuffer};
-use crate::buffer_pool::BufferPool;
+use crate::buffer_pool::{BufferPool, BufferPoolConfig};
 use crate::context::GpuContext;
 use crate::error::GpuError;
 use crate::pipeline::ComputePipeline;
 
 const SHA256_WGSL: &str = include_str!("sha256.wgsl");
-const DEFAULT_WORKGROUP_SIZE: [u32; 3] = [256, 1, 1];
+const SHA256_CHAINED_WGSL: &str = include_str!("sha256_chained.wgsl");
+
+/// SHA-256 计算器的默认 workgroup 大小。
+pub const SHA256_DEFAULT_WORKGROUP_SIZE: [u32; 3] = [256, 1, 1];
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -47,10 +50,10 @@ const MAX_SINGLE_BLOCK_MSG_LEN: usize = 55;
 /// ```
 pub struct Sha256Computer {
     pipeline: Arc<ComputePipeline>,
+    pipeline_chained: Arc<ComputePipeline>,
     workgroup_size: [u32; 3],
     buffer_pool: BufferPool,
     cached_single_block_params: RefCell<HashMap<u32, GpuBuffer>>,
-    cached_multi_block_params: RefCell<Option<GpuBuffer>>,
 }
 
 /// SHA-256 异步批量提交器，真批量提交实现。
@@ -84,12 +87,14 @@ struct PendingBatch {
     output_buffer: GpuBuffer,
     staging_buffer: wgpu::Buffer,
     is_single_block: bool,
+    /// 延迟释放的 input buffer（raw wgpu::Buffer），在 wait_all 提交后才释放
+    input_buffers_to_release: Vec<wgpu::Buffer>,
 }
 
 impl Sha256Computer {
     /// 创建 SHA-256 计算器，使用默认 workgroup_size [256, 1, 1]。
     pub fn new(ctx: &mut GpuContext) -> Result<Self, GpuError> {
-        Self::with_workgroup_size(ctx, DEFAULT_WORKGROUP_SIZE)
+        Self::with_workgroup_size(ctx, SHA256_DEFAULT_WORKGROUP_SIZE)
     }
 
     /// 创建 SHA-256 计算器，指定 workgroup_size。
@@ -97,13 +102,34 @@ impl Sha256Computer {
         ctx: &mut GpuContext,
         workgroup_size: [u32; 3],
     ) -> Result<Self, GpuError> {
+        Self::with_config(ctx, workgroup_size, BufferPool::new())
+    }
+
+    /// 创建 SHA-256 计算器，指定 workgroup_size 和缓冲区池配置。
+    ///
+    /// 当需要与其他组件共享缓冲区池或精细控制池行为时使用此构造方法。
+    pub fn with_buffer_pool_config(
+        ctx: &mut GpuContext,
+        workgroup_size: [u32; 3],
+        pool_config: BufferPoolConfig,
+    ) -> Result<Self, GpuError> {
+        Self::with_config(ctx, workgroup_size, BufferPool::with_config(pool_config))
+    }
+
+    /// 创建 SHA-256 计算器，完全自定义配置。
+    fn with_config(
+        ctx: &mut GpuContext,
+        workgroup_size: [u32; 3],
+        buffer_pool: BufferPool,
+    ) -> Result<Self, GpuError> {
         let pipeline = ctx.get_or_create_pipeline(SHA256_WGSL, workgroup_size)?;
+        let pipeline_chained = ctx.get_or_create_pipeline(SHA256_CHAINED_WGSL, workgroup_size)?;
         Ok(Self {
             pipeline,
+            pipeline_chained,
             workgroup_size,
-            buffer_pool: BufferPool::new(),
+            buffer_pool,
             cached_single_block_params: RefCell::new(HashMap::new()),
-            cached_multi_block_params: RefCell::new(None),
         })
     }
 
@@ -209,8 +235,8 @@ impl Sha256Computer {
 
         let result = output_buffer.download(device, queue)?;
 
-        self.buffer_pool.release(input_buffer.into_raw());
-        self.buffer_pool.release(output_buffer.into_raw());
+        self.buffer_pool.release(input_buffer.into_raw(), BufferUsage::Storage);
+        self.buffer_pool.release(output_buffer.into_raw(), BufferUsage::Storage);
 
         let mut hashes = Vec::with_capacity(count);
         let raw_u32 = bytemuck::cast_slice::<u8, u32>(&result);
@@ -247,86 +273,63 @@ impl Sha256Computer {
         }
     }
 
-    /// 获取或创建 multi block 场景的 params buffer（固定参数，只创建一次）。
-    fn get_or_create_multi_block_params(&self, device: &wgpu::Device) -> GpuBuffer {
-        let mut cache = self.cached_multi_block_params.borrow_mut();
-        if let Some(buf) = &*cache {
-            buf.clone()
-        } else {
-            let params = Sha256Params {
-                message_count: 1,
-                block_mode: 1,
-                _padding: [0; 2],
-            };
-            let buf = GpuBuffer::from_data(device, &[params], BufferUsage::Uniform);
-            *cache = Some(buf.clone());
-            buf
-        }
-    }
-
-    /// 计算多 block 消息批量（>55 字节）。
+    /// 计算多 block 消息批量（>55 字节）—— 链式着色器，单 dispatch 处理全部 block。
     fn compute_multi_block_batch(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         messages: &[&Vec<u8>],
     ) -> Result<Vec<[u8; 32]>, GpuError> {
-        let initial_hash: [u32; 8] = [
-            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-            0x5be0cd19,
-        ];
+        let count = messages.len();
 
-        let mut hashes = Vec::with_capacity(messages.len());
-
+        // 链式着色器输入：[block_counts...][all_blocks...]
+        let mut block_counts = Vec::with_capacity(count);
+        let mut all_block_words = Vec::new();
         for msg in messages {
             let blocks = split_into_blocks(msg);
-            let mut intermediate = initial_hash;
-
+            block_counts.push(blocks.len() as u32);
             for block in &blocks {
-                let block_words = bytes_to_be_u32(block);
-
-                let mut input_words = Vec::with_capacity(HASH_U32_COUNT + BLOCK_U32_COUNT);
-                input_words.extend_from_slice(&intermediate);
-                input_words.extend_from_slice(&block_words);
-
-                let input_size = (input_words.len() * 4) as u64;
-                let output_size = (HASH_U32_COUNT * 4) as u64;
-
-                let input_buffer_raw = self.buffer_pool.acquire(device, input_size, BufferUsage::Storage);
-                let output_buffer_raw = self.buffer_pool.acquire(device, output_size, BufferUsage::Storage);
-
-                queue.write_buffer(&input_buffer_raw, 0, bytemuck::cast_slice(&input_words));
-
-                let input_buffer = GpuBuffer::from_raw(input_buffer_raw, input_size);
-                let output_buffer = GpuBuffer::from_raw(output_buffer_raw, output_size);
-
-                let params_buffer = self.get_or_create_multi_block_params(device);
-
-                self.pipeline.dispatch(
-                    device,
-                    queue,
-                    &input_buffer,
-                    &output_buffer,
-                    &params_buffer,
-                    [1, 1, 1],
-                );
-
-                let result = output_buffer.download(device, queue)?;
-
-                self.buffer_pool.release(input_buffer.into_raw());
-                self.buffer_pool.release(output_buffer.into_raw());
-
-                let raw = bytemuck::cast_slice::<u8, u32>(&result);
-                intermediate.copy_from_slice(&raw[..HASH_U32_COUNT]);
+                all_block_words.extend_from_slice(&bytes_to_be_u32(block));
             }
+        }
 
+        let total_u32 = count + all_block_words.len();
+        let input_size = (total_u32 * 4) as u64;
+        let output_size = (count * HASH_U32_COUNT * 4) as u64;
+
+        let input_buffer_raw = self.buffer_pool.acquire(device, input_size, BufferUsage::Storage);
+        let output_buffer_raw = self.buffer_pool.acquire(device, output_size, BufferUsage::Storage);
+
+        let mut input_words = Vec::with_capacity(total_u32);
+        input_words.extend_from_slice(&block_counts);
+        input_words.extend_from_slice(&all_block_words);
+        queue.write_buffer(&input_buffer_raw, 0, bytemuck::cast_slice(&input_words));
+
+        let input_buffer = GpuBuffer::from_raw(input_buffer_raw, input_size);
+        let output_buffer = GpuBuffer::from_raw(output_buffer_raw, output_size);
+
+        let params = Sha256Params { message_count: count as u32, block_mode: 0, _padding: [0; 2] };
+        let params_buffer = GpuBuffer::from_data(device, &[params], BufferUsage::Uniform);
+
+        let dispatch_x = (count as u32).div_ceil(self.workgroup_size[0]).max(1);
+        self.pipeline_chained.dispatch(
+            device, queue, &input_buffer, &output_buffer, &params_buffer, [dispatch_x, 1, 1],
+        );
+
+        let result = output_buffer.download(device, queue)?;
+        self.buffer_pool.release(input_buffer.into_raw(), BufferUsage::Storage);
+        self.buffer_pool.release(output_buffer.into_raw(), BufferUsage::Storage);
+
+        let raw_u32 = bytemuck::cast_slice::<u8, u32>(&result);
+        let mut hashes = Vec::with_capacity(count);
+        for i in 0..count {
             let mut hash = [0u8; 32];
-            for (i, &w) in intermediate.iter().enumerate() {
-                hash[i * 4..(i + 1) * 4].copy_from_slice(&w.to_be_bytes());
+            for j in 0..HASH_U32_COUNT {
+                let w = raw_u32[i * HASH_U32_COUNT + j];
+                hash[j * 4..(j + 1) * 4].copy_from_slice(&w.to_be_bytes());
             }
             hashes.push(hash);
         }
-
         Ok(hashes)
     }
 }
@@ -379,18 +382,31 @@ impl<'a> Sha256BatchSubmitter<'a> {
             self.pending_batches.iter().map(|b| b.message_count).sum(),
         );
 
+        let mut map_receivers: Vec<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>> =
+            Vec::with_capacity(self.pending_batches.len());
         for pending in &self.pending_batches {
+            let (send_map, recv_map) = std::sync::mpsc::channel();
             pending
                 .staging_buffer
                 .slice(..)
-                .map_async(wgpu::MapMode::Read, |result| {
-                    if let Err(e) = result {
-                        log::error!("批量 staging buffer 映射失败: {}", e);
-                    }
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    send_map.send(result).ok();
                 });
+            map_receivers.push(recv_map);
         }
 
         self.device.poll(wgpu::Maintain::Wait);
+
+        // 验证所有 staging buffer 映射成功
+        for recv in &map_receivers {
+            match recv
+                .recv()
+                .map_err(|_| GpuError::MapFailed("批量映射通道关闭，GPU 设备可能已丢失".into()))?
+            {
+                Ok(()) => {}
+                Err(e) => return Err(GpuError::MapFailed(format!("批量 staging buffer 映射失败: {}", e))),
+            }
+        }
 
         for pending in self.pending_batches.drain(..) {
             let view = pending.staging_buffer.slice(..).get_mapped_range();
@@ -417,7 +433,11 @@ impl<'a> Sha256BatchSubmitter<'a> {
                 results.push((pending.original_indices[0], hash));
             }
 
-            self.computer.buffer_pool.release(pending.output_buffer.into_raw());
+            self.computer.buffer_pool.release(pending.output_buffer.into_raw(), BufferUsage::Storage);
+            // 释放延迟持有的 input buffers
+            for input_buf in pending.input_buffers_to_release {
+                self.computer.buffer_pool.release(input_buf, BufferUsage::Storage);
+            }
         }
 
         Ok(results)
@@ -498,7 +518,8 @@ impl<'a> Sha256BatchSubmitter<'a> {
         });
         encoder.copy_buffer_to_buffer(output_buffer.raw(), 0, &staging, 0, output_size);
 
-        self.computer.buffer_pool.release(input_buffer.into_raw());
+        // 延迟释放 input buffer，防止在 encoder 提交前被 pool 复用
+        let input_raw = input_buffer.into_raw();
 
         self.pending_batches.push(PendingBatch {
             message_count: count,
@@ -506,118 +527,63 @@ impl<'a> Sha256BatchSubmitter<'a> {
             output_buffer,
             staging_buffer: staging,
             is_single_block: true,
+            input_buffers_to_release: vec![input_raw],
         });
 
         Ok(())
     }
 
-    /// 提交多 block 消息——由于数据依赖，中间 block 需同步等待。
+    /// 提交多 block 消息——链式着色器，单 dispatch 不中断异步流水线。
     fn submit_multi_block_message(
         &mut self,
         message: &[u8],
         original_index: usize,
     ) -> Result<(), GpuError> {
-        // 先提交累积的 encoder，确保之前的 dispatch 先于多 block 的 dispatch
-        if let Some(encoder) = self.encoder.take() {
-            self.queue.submit(std::iter::once(encoder.finish()));
-        }
-
         let blocks = split_into_blocks(message);
-        let initial_hash: [u32; 8] = [
-            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-            0x5be0cd19,
-        ];
+        let block_count = blocks.len() as u32;
 
-        let mut intermediate = initial_hash;
-
-        for (block_idx, block) in blocks.iter().enumerate() {
-            let block_words = bytes_to_be_u32(block);
-
-            let mut input_words = Vec::with_capacity(HASH_U32_COUNT + BLOCK_U32_COUNT);
-            input_words.extend_from_slice(&intermediate);
-            input_words.extend_from_slice(&block_words);
-
-            let input_size = (input_words.len() * 4) as u64;
-            let output_size = (HASH_U32_COUNT * 4) as u64;
-
-            let input_buffer_raw = self
-                .computer
-                .buffer_pool
-                .acquire(self.device, input_size, BufferUsage::Storage);
-            let output_buffer_raw = self
-                .computer
-                .buffer_pool
-                .acquire(self.device, output_size, BufferUsage::Storage);
-
-            self.queue
-                .write_buffer(&input_buffer_raw, 0, bytemuck::cast_slice(&input_words));
-
-            let input_buffer = GpuBuffer::from_raw(input_buffer_raw, input_size);
-            let output_buffer = GpuBuffer::from_raw(output_buffer_raw, output_size);
-
-            let params_buffer = self
-                .computer
-                .get_or_create_multi_block_params(self.device);
-
-            let is_last_block = block_idx == blocks.len() - 1;
-
-            if is_last_block {
-                // 末 block：dispatch + copy 编码到新 encoder，不立即提交
-                let mut encoder = self.device.create_command_encoder(
-                    &wgpu::CommandEncoderDescriptor {
-                        label: Some("sha256_multi_last"),
-                    },
-                );
-
-                self.computer.pipeline.encode_dispatch_into(
-                    self.device,
-                    &mut encoder,
-                    &input_buffer,
-                    &output_buffer,
-                    &params_buffer,
-                    [1, 1, 1],
-                );
-
-                let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("sha256_multi_staging"),
-                    size: output_size,
-                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                encoder.copy_buffer_to_buffer(output_buffer.raw(), 0, &staging, 0, output_size);
-
-                // 将此 encoder 存为共享 encoder，后续单 block 可继续编码
-                self.encoder = Some(encoder);
-
-                self.computer.buffer_pool.release(input_buffer.into_raw());
-
-                self.pending_batches.push(PendingBatch {
-                    message_count: 1,
-                    original_indices: vec![original_index],
-                    output_buffer,
-                    staging_buffer: staging,
-                    is_single_block: false,
-                });
-            } else {
-                // 中间 block：同步 dispatch + download
-                self.computer.pipeline.dispatch(
-                    self.device,
-                    self.queue,
-                    &input_buffer,
-                    &output_buffer,
-                    &params_buffer,
-                    [1, 1, 1],
-                );
-
-                let result = output_buffer.download(self.device, self.queue)?;
-                let raw = bytemuck::cast_slice::<u8, u32>(&result);
-                intermediate.copy_from_slice(&raw[..HASH_U32_COUNT]);
-
-                self.computer.buffer_pool.release(output_buffer.into_raw());
-                self.computer.buffer_pool.release(input_buffer.into_raw());
-            }
+        let mut input_words = Vec::with_capacity(1 + block_count as usize * BLOCK_U32_COUNT);
+        input_words.push(block_count);
+        for block in &blocks {
+            input_words.extend_from_slice(&bytes_to_be_u32(block));
         }
 
+        let input_size = (input_words.len() * 4) as u64;
+        let output_size = (HASH_U32_COUNT * 4) as u64;
+
+        let input_buf_raw = self.computer.buffer_pool.acquire(self.device, input_size, BufferUsage::Storage);
+        let output_buf_raw = self.computer.buffer_pool.acquire(self.device, output_size, BufferUsage::Storage);
+        self.queue.write_buffer(&input_buf_raw, 0, bytemuck::cast_slice(&input_words));
+        let input_gpu = GpuBuffer::from_raw(input_buf_raw.clone(), input_size);
+        let output_gpu = GpuBuffer::from_raw(output_buf_raw, output_size);
+
+        let params = Sha256Params { message_count: 1, block_mode: 0, _padding: [0; 2] };
+        let params_buf = GpuBuffer::from_data(self.device, &[params], BufferUsage::Uniform);
+
+        if self.encoder.is_none() {
+            self.encoder = Some(self.device.create_command_encoder(
+                &wgpu::CommandEncoderDescriptor { label: Some("sha256_batch_encoder") },
+            ));
+        }
+        let encoder = self.encoder.as_mut().unwrap();
+
+        self.computer.pipeline_chained.encode_dispatch_into(
+            self.device, encoder, &input_gpu, &output_gpu, &params_buf, [1, 1, 1],
+        );
+
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sha256_chained_stg"), size: output_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        encoder.copy_buffer_to_buffer(output_gpu.raw(), 0, &staging, 0, output_size);
+
+        // 延迟释放 input buffer，防止在 encoder 提交前被 pool 复用
+        self.pending_batches.push(PendingBatch {
+            message_count: 1, original_indices: vec![original_index],
+            output_buffer: output_gpu, staging_buffer: staging, is_single_block: false,
+            input_buffers_to_release: vec![input_buf_raw],
+        });
         Ok(())
     }
 }

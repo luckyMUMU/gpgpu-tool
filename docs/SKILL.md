@@ -58,12 +58,13 @@ Cross-platform GPU compute engine built on wgpu. Provides out-of-the-box GPU acc
 | `HashAlgorithm` | `tasks::phasher` | Algorithm selector enum |
 | `BkTree` | `tasks::bktree` | BK-tree approximate nearest neighbor search |
 | `hamming_distance` | `tasks::bktree` | Hamming distance between two u64 hashes |
+| `HashSize` | `tasks::hash_common` | Hash grid size configuration (8/16/32/64), replaces deprecated `HashBits` |
 
 ### Internal Modules (#[doc(hidden)], avoid direct use)
 
 | Module | Why hidden | Use instead |
 |--------|-----------|-------------|
-| `tasks::hash_common` | Internal trait + macros | `PerceptualHasher` |
+| `tasks::hash_common` | Internal trait + macros + HashSize | `PerceptualHasher` or individual `*HashComputer` |
 | `tasks::gpu_resize` | Internal GPU resize impl | `PerceptualHasher::with_resize_mode(true)` |
 | `tasks::mean_hash` etc. | Thin wrappers via macros | `PerceptualHasher::new(algo)` |
 
@@ -95,13 +96,24 @@ let hashes: Vec<[u8; 32]> = sha256.compute(&ctx, &messages)?;
 
 ```rust
 use wgpu_compute_engine::{GpuContext, tasks::phasher::{PerceptualHasher, HashAlgorithm}};
+use wgpu_compute_engine::tasks::hash_common::HashSize;
 
 let mut ctx = GpuContext::new_sync()?;
 
-// CPU resize path (default, good for small batches)
+// Default hash_size=8 (64-bit hash)
 let hasher = PerceptualHasher::new(&mut ctx, HashAlgorithm::Mean)?;
 
-// Input: grayscale pixel arrays + dimensions (all same size for batch)
+// Custom hash_size=16 (256-bit hash)
+let hasher = PerceptualHasher::with_hash_size(
+    &mut ctx, HashAlgorithm::Mean, HashSize::new(16)
+)?;
+
+// Full config: hash_size + GPU resize + workgroup_size
+let hasher = PerceptualHasher::with_full_config(
+    &mut ctx, HashAlgorithm::Mean, true, HashSize::new(16), [256, 1, 1]
+)?;
+
+// Input: grayscale pixel arrays + dimensions
 let images: Vec<Vec<u8>> = vec![vec![128u8; 256 * 256]];
 let dimensions: Vec<(u32, u32)> = vec![(256, 256)];
 let hashes: Vec<u64> = hasher.compute(&ctx, &images, &dimensions)?;
@@ -109,21 +121,21 @@ let hashes: Vec<u64> = hasher.compute(&ctx, &images, &dimensions)?;
 
 **Algorithm selection guide**:
 
-| Algorithm | Size | Best for | Speed |
-|-----------|------|----------|-------|
-| `Mean` | 8×8 | General similarity, fast baseline | Fastest |
-| `Median` | 8×8 | Robust to outliers (bright spots) | Fast |
-| `Gradient` | 8×9 | Edge-sensitive, rotation-aware | Fast |
-| `Block` | 16×16 | Local feature preservation | Slower (more pixels) |
-| `VertGradient` | 9×8 | Vertical edge detection | Fast |
-| `DoubleGradient` | 9×9 | Bidirectional edge detection | Fast |
+| Algorithm | Default Size | hash_size=16 Size | Best for | Speed |
+|-----------|-------------|-------------------|----------|-------|
+| `Mean` | 8×8 | 16×16 | General similarity, fast baseline | Fastest |
+| `Median` | 8×8 | 16×16 | Robust to outliers (bright spots) | Fast |
+| `Gradient` | 8×9 | 16×17 | Edge-sensitive, rotation-aware | Fast |
+| `Block` | 8×8 | 16×16 | Local feature preservation | Slower |
+| `VertGradient` | 9×8 | 17×16 | Vertical edge detection | Fast |
+| `DoubleGradient` | 9×9 | 17×17 | Bidirectional edge detection | Fast |
 
 ### Pattern 3: GPU Zero-Copy Pipeline (Large Images)
 
 ```rust
-// GPU resize path (for large images, 512×512+)
-let hasher = PerceptualHasher::with_resize_mode(
-    &mut ctx, HashAlgorithm::Mean, true  // true = GPU resize
+// GPU resize path with custom hash_size
+let hasher = PerceptualHasher::with_full_config(
+    &mut ctx, HashAlgorithm::Mean, true, HashSize::new(16), [256, 1, 1]
 )?;
 
 // Same API, internally: GPU resize → GPU hash (no CPU intermediate)
@@ -234,6 +246,7 @@ let results: Vec<Vec<u8>> = submitter.wait_all()?;
 4. **Handle `GpuError::NoAdapter`** — GPU may not be available; always provide CPU fallback
 5. **Use `with_resize_mode(true)` for large images** — enables zero-copy GPU pipeline
 6. **Match image dimensions for batch** — `PerceptualHasher::compute()` requires all images in a batch to have the same dimensions
+7. **Use `HashSize::new(N)` for larger hashes** — default is 8 (64-bit); use 16/32 for higher precision
 
 ### MUST NOT DO
 
@@ -286,12 +299,12 @@ let results: Vec<Vec<u8>> = submitter.wait_all()?;
 ```rust
 match GpuContext::new_sync() {
     Ok(mut ctx) => {
-        // GPU available, use GPU path
-        let hasher = PerceptualHasher::new(&mut ctx, HashAlgorithm::Mean)?;
+        let hasher = PerceptualHasher::with_hash_size(
+            &mut ctx, HashAlgorithm::Mean, HashSize::new(16)
+        )?;
         let hashes = hasher.compute(&ctx, &images, &dimensions)?;
     }
     Err(GpuError::NoAdapter) => {
-        // No GPU available, fall back to CPU implementation
         eprintln!("GPU not available, using CPU fallback");
     }
     Err(e) => return Err(e.into()),
@@ -311,14 +324,28 @@ match GpuContext::new_sync() {
 ### Mode B: Perceptual Hash Algorithm
 
 1. Create `src/tasks/new_hash.rs` + `src/tasks/new_hash.wgsl`
-2. Use macros: `declare_phash_computer!` + `impl_phash_computer_simple!`
+2. Use macros: `declare_phash_computer!` + `impl_phash_computer_simple!` (generates `hash_size: HashSize` field)
 3. Add variant to `HashAlgorithm` enum in `phasher.rs`
-4. Add match arm in `PerceptualHasher::new()`
+4. Add match arm in `PerceptualHasher::with_full_config_and_gpu_resize()`
 5. Export in `src/tasks/mod.rs` (with `#[doc(hidden)]`)
 
 ### WGSL Shader Requirements
 
 - Must use binding layout: `@binding(0)` input, `@binding(1)` output, `@binding(2)` uniform params
+- Params struct (32 bytes, 16-byte aligned):
+```wgsl
+struct Params {
+    image_count: u32,
+    width: u32,
+    height: u32,
+    hash_size_bits: u32,
+    hash_size: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
+};
+@group(0) @binding(2) var<uniform> params: Params;
+```
 - Entry point must be `fn main(@builtin(global_invocation_id) gid: vec3<u32>)`
 - Must be a separate `.wgsl` file (NOT inline string)
 - Use `include_str!("shader.wgsl")` to load

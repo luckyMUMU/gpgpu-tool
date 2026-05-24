@@ -1,6 +1,6 @@
 # wgpu-compute-engine 技术架构文档
 
-> **版本**: 0.1.0 | **Rust Edition**: 2021 | **wgpu**: v24 | **生成日期**: 2026-05-22
+> **版本**: 0.2.0 | **Rust Edition**: 2021 | **wgpu**: v24 | **生成日期**: 2026-05-23
 
 ---
 
@@ -19,6 +19,7 @@ wgpu-compute-engine 是一个基于 wgpu 的跨平台 GPU 通用计算引擎，�
 | **零拷贝流水线** | GPU 缩放→哈希直通，无需 CPU 中间缓存 |
 | **BK-tree 近似搜索** | O(log N) 汉明距离最近邻搜索 |
 | **算法可扩展** | 新算法只需实现 `.rs` + `.wgsl` 配对，复用能力层基础设施 |
+| **灵活 HashSize** | 支持 8/16/32/64 网格尺寸，输出 64-4096 bit 哈希 |
 
 ### 1.2 技术栈
 
@@ -373,19 +374,21 @@ PerceptualHasher
 ├── target_width: u32                     # 目标宽度
 ├── target_height: u32                    # 目标高度
 ├── computer: Box<dyn PerceptualHashComputer> # 多态计算器
-└── gpu_resize: Option<GpuResize>         # GPU 缩放器（可启用）
+├── gpu_resize: Option<GpuResize>         # GPU 缩放器（可启用）
+├── hash_size: HashSize                   # 网格尺寸配置
+└── max_batch_size: u64                   # 单批最大缓冲区字节数
 ```
 
 **支持的算法**:
 
-| 算法 | 目标尺寸 | 适用场景 |
-|------|---------|---------|
-| Mean | 8×8 | 基础相似度比较 |
-| Median | 8×8 | 对极端值更鲁棒 |
-| Gradient | 8×9 | 边缘敏感 |
-| Block | 16×16 | 局部特征保留 |
-| VertGradient | 9×8 | 垂直边缘敏感 |
-| DoubleGradient | 9×9 | 双向边缘敏感 |
+| 算法 | 目标尺寸（hash_size=8） | 目标尺寸（hash_size=16） | 适用场景 |
+|------|------------------------|-------------------------|---------|
+| Mean | 8×8 | 16×16 | 基础相似度比较 |
+| Median | 8×8 | 16×16 | 对极端值更鲁棒 |
+| Gradient | 8×9 | 16×17 | 边缘敏感 |
+| Block | 8×8 | 16×16 | 局部特征保留 |
+| VertGradient | 9×8 | 17×16 | 垂直边缘敏感 |
+| DoubleGradient | 9×9 | 17×17 | 双向边缘敏感 |
 
 **工作流程** (默认 CPU 缩放路径):
 ```
@@ -418,20 +421,47 @@ PerceptualHasher
 ```rust
 #[repr(C)]
 pub struct PhashParams {
-    pub image_count: u32,  // WGSL params.x
-    pub width: u32,        // WGSL params.y
-    pub height: u32,       // WGSL params.z
-    pub _padding: u32,     // WGSL params.w
+    pub image_count: u32,
+    pub width: u32,
+    pub height: u32,
+    pub hash_size_bits: u32,
+    pub hash_size: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
 }
 ```
 
-2. **PerceptualHashComputer trait** — 统一接口（新增零拷贝支持）
+2. **HashSize** — 网格尺寸配置（替代已废弃的 HashBits）
+```rust
+pub struct HashSize(u32);  // 存储网格边长
+
+impl HashSize {
+    pub fn new(size: u32) -> Self;       // 创建指定网格尺寸
+    pub fn size(self) -> u32;            // 获取网格边长
+    pub fn bits(self) -> u32;            // 哈希位宽 = size²
+    pub fn u32s_per_image(self) -> u32;  // 每图 u32 数
+    pub fn u64s_per_image(self) -> u32;  // 每图 u64 数
+}
+```
+
+| hash_size | 网格尺寸 | 哈希位宽 |
+|-----------|---------|---------|
+| 8  | 8×8   | 64 bit   |
+| 16 | 16×16 | 256 bit  |
+| 32 | 32×32 | 1024 bit |
+| 64 | 64×64 | 4096 bit |
+
+3. **PerceptualHashComputer trait** — 统一接口（新增零拷贝支持）
 ```rust
 pub trait PerceptualHashComputer {
     fn compute(&self, ctx: &GpuContext, images: &[Vec<u8>])
         -> Result<Vec<u64>, GpuError>;
-    fn pipeline(&self) -> &Arc<ComputePipeline>;        // 零拷贝需要
-    fn workgroup_size(&self) -> [u32; 3];               // 零拷贝需要
+    fn compute_sized(&self, ctx: &GpuContext, images: &[Vec<u8>], hash_size: HashSize)
+        -> Result<Vec<u64>, GpuError>;
+    fn pipeline(&self) -> &ComputePipeline;
+    fn workgroup_size(&self) -> [u32; 3];
+    fn hash_size(&self) -> HashSize;
 }
 ```
 
@@ -464,6 +494,8 @@ declare_phash_computer!(
 );
 impl_phash_computer_simple!(MeanHashComputer);
 ```
+
+> **注意**: 宏现在自动生成 `hash_size: HashSize` 字段和 `with_config(ctx, workgroup_size, hash_size)` 构造器。
 
 ### 4.5 GpuResize — GPU 图像缩放
 
@@ -696,9 +728,19 @@ lib.rs
 // 固定绑定布局（与 ComputePipeline 一致）
 @group(0) @binding(0) var<storage, read> input: array<T>;
 @group(0) @binding(1) var<storage, read_write> output: array<T>;
-@group(0) @binding(2) var<uniform> params: vec4<u32>;
 
-// 入口函数必须为 main
+struct Params {
+    image_count: u32,
+    width: u32,
+    height: u32,
+    hash_size_bits: u32,
+    hash_size: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
+};
+@group(0) @binding(2) var<uniform> params: Params;
+
 @compute @workgroup_size(N)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // ...
@@ -771,6 +813,9 @@ cargo clippy                        # lint 检查
 | Pipeline 使用 Arc | 引用计数共享 | 业务层可持有管线引用，无需 borrow |
 | GPU 缩放输出格式 | 1 u32/像素 | 匹配 hash shader 输入格式，零拷贝直通 |
 | 分批策略 | 调用方分批 | phasher 层控制，gpu_resize 只负责单批 |
+| HashSize 替代 HashBits | 结构体替代枚举 | 支持任意 2 的幂次网格尺寸，扩展性更好 |
+| PhashParams 扩展为 8 字段 | 32 字节 uniform | 传递 hash_size 到 WGSL，支持动态网格计算 |
+| block_hash 即时计算 block_mean | 函数调用替代大数组 | 避免 DX12 临时寄存器溢出（原 array<u32,4096> 超限） |
 
 ---
 
@@ -780,10 +825,10 @@ cargo clippy                        # lint 检查
 |------|------|
 | GPU 调度开销 | 单次 dispatch 约 1.6ms，小批量场景不如 CPU |
 | Multi-block 数据依赖 | SHA-256 多 block 消息无法完全并行，中间 block 需同步 |
-| 固定 Bind Group Layout | 所有算法共享 3-binding 布局，灵活性受限 |
 | image feature 可选 | 默认不启用图像支持，需显式开启 |
 | GPU 缩放质量 | box filter 适合下采样，上采样质量不如 Lanczos |
 | 分批粒度 | 分批依据 256MB 硬限制，未考虑实际显存容量 |
+| HashSize=64 DX12 限制 | hash_size=64 时部分着色器可能因工作寄存器压力在 DX12 后端编译失败 |
 
 ---
 

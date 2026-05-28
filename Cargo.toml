@@ -1,0 +1,103 @@
+[package]
+name = "gpgpu-tool"
+version = "0.2.0"
+description = "GPGPU 加速算法库，基于 wgpu。优先使用 GPU 加速，支持 CPU 降级。提供 SHA-256、感知哈希、BK-tree 相似度搜索等开箱即用的 GPU 计算能力。"
+edition = "2021"
+license = "GPL-3.0"
+readme = "README.md"
+repository = "https://github.com/solo-king/wgpu-tool"
+keywords = ["gpu", "compute", "wgpu", "parallel", "hashing"]
+categories = ["science::gpu", "algorithms::data-processing"]
+
+[dependencies]
+wgpu = "24"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+thiserror = "2"
+log = "0.4"
+image = { version = "0.25", optional = true }
+
+sha2 = { version = "0.10", optional = true }
+
+[features]
+default = ["cpu-fallback"]
+cpu-fallback = ["dep:sha2"]
+pdq = []
+image = ["dep:image"]
+
+[dev-dependencies]
+rand = "0.9"
+criterion = { version = "0.5", features = ["html_reports"] }
+env_logger = "0.11"
+hex = "0.4"
+chrono = "0.4"
+image = "0.25"
+img_hash = "3.2"
+
+[package.metadata.docs.rs]
+features = ["image"]
+
+[[bench]]
+name = "sha256_bench"
+path = "benches/sha256_bench.rs"
+harness = false
+
+[[bench]]
+name = "mean_hash_bench"
+path = "benches/mean_hash_bench.rs"
+harness = false
+
+[[bench]]
+name = "gradient_hash_bench"
+path = "benches/gradient_hash_bench.rs"
+harness = false
+
+[[bench]]
+name = "block_hash_bench"
+path = "benches/block_hash_bench.rs"
+harness = false
+
+[[bench]]
+name = "vert_gradient_hash_bench"
+path = "benches/vert_gradient_hash_bench.rs"
+harness = false
+
+[[bench]]
+name = "double_gradient_hash_bench"
+path = "benches/double_gradient_hash_bench.rs"
+harness = false
+
+[[bench]]
+name = "median_hash_bench"
+path = "benches/median_hash_bench.rs"
+harness = false
+
+[[bench]]
+name = "bktree_bench"
+path = "benches/bktree_bench.rs"
+harness = false
+
+[[bench]]
+name = "gpu_utilization_bench"
+path = "benches/gpu_utilization_bench.rs"
+harness = false
+
+[[bench]]
+name = "real_image_bench"
+path = "benches/real_image_bench.rs"
+harness = false
+
+[[bench]]
+name = "gpu_stress_bench"
+path = "benches/gpu_stress_bench.rs"
+harness = false
+
+[[bench]]
+name = "large_scale_bench"
+path = "benches/large_scale_bench.rs"
+harness = false
+
+[[bench]]
+name = "phash_bench"
+path = "benches/phash_bench.rs"
+harness = false

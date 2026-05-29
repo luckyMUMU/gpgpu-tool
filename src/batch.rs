@@ -130,7 +130,7 @@ impl GpuBatchSubmitter {
     /// 然后逐个映射 staging buffer 读取结果。
     ///
     /// 返回的 `Vec<Vec<u8>>` 与提交顺序一一对应。
-    pub fn wait_all(&mut self, ctx: &crate::context::GpuContext) -> Result<Vec<Vec<u8>>, GpuError> {
+    pub fn wait_all(&mut self) -> Result<Vec<Vec<u8>>, GpuError> {
         if self.pending.is_empty() {
             return Ok(vec![]);
         }
@@ -189,8 +189,10 @@ impl GpuBatchSubmitter {
                     pending.staging_buffer.unmap();
                 }
             }
-            for pending in self.pending.drain(..) {
-                ctx.buffer_pool().release_staging(pending.staging_buffer);
+            if let Some(pool) = self.pool.as_ref() {
+                for pending in self.pending.drain(..) {
+                    pool.release_staging(pending.staging_buffer);
+                }
             }
             self.device = None;
             self.queue = None;
@@ -198,13 +200,15 @@ impl GpuBatchSubmitter {
             return Err(e);
         }
 
-        for pending in self.pending.drain(..) {
-            let view = pending.staging_buffer.slice(..).get_mapped_range();
-            let data = view.to_vec();
-            drop(view);
-            pending.staging_buffer.unmap();
-            ctx.buffer_pool().release_staging(pending.staging_buffer);
-            results.push(data);
+        if let Some(pool) = self.pool.as_ref() {
+            for pending in self.pending.drain(..) {
+                let view = pending.staging_buffer.slice(..).get_mapped_range();
+                let data = view.to_vec();
+                drop(view);
+                pending.staging_buffer.unmap();
+                pool.release_staging(pending.staging_buffer);
+                results.push(data);
+            }
         }
 
         self.device = None;

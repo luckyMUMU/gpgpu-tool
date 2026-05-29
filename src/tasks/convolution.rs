@@ -16,6 +16,16 @@ const MAX_KERNEL_SIZE: u32 = 11;
 /// uniform buffer 中卷积核数组的固定长度（124 个 f32，对齐到 vec4 边界）。
 const KERNEL_ARRAY_LEN: usize = 124;
 
+const MAX_RADIUS: u32 = (MAX_KERNEL_SIZE - 1) / 2;
+const WG_X: u32 = DEFAULT_CONVOLUTION_WORKGROUP_SIZE[0];
+const WG_Y: u32 = DEFAULT_CONVOLUTION_WORKGROUP_SIZE[1];
+const LDS_H_SIZE: u32 = (WG_Y + 2 * MAX_RADIUS) * WG_X;
+
+const _: () = assert!(
+    LDS_H_SIZE == 144,
+    "LDS 大小与 WGSL 不一致，请同步更新 convolution.wgsl 中的 lds_h 声明"
+);
+
 /// pass_mode 常量：融合可分离卷积（LDS 优化）。
 const PASS_MODE_FUSED_SEPARABLE: u32 = 3;
 
@@ -142,7 +152,7 @@ impl GpuConvolution {
 
         let device = ctx.device()?;
         let queue = ctx.queue()?;
-        let pixel_count = (width * height) as usize;
+        let pixel_count = (width as u64 * height as u64) as usize;
 
         let packed = crate::pixel_pack::pack_u8_to_u32(pixels);
 
@@ -227,7 +237,7 @@ impl GpuConvolution {
     ) -> Result<GpuBuffer, GpuError> {
         validate_1d_kernel(kernel_1d, kernel_size)?;
 
-        let pixel_count = (width * height) as usize;
+        let pixel_count = (width as u64 * height as u64) as usize;
         if input_u32_count != pixel_count {
             return Err(GpuError::InvalidInput(
                 "输入 u32 数量与声明尺寸不符".to_string(),
@@ -316,7 +326,7 @@ impl GpuConvolution {
     ) -> Result<GpuBuffer, GpuError> {
         let device = ctx.device()?;
         let queue = ctx.queue()?;
-        let pixel_count = (width * height) as usize;
+        let pixel_count = (width as u64 * height as u64) as usize;
         let buffer_size = (pixel_count * 4) as u64;
 
         let output_buffer_raw = ctx
@@ -355,7 +365,7 @@ impl GpuConvolution {
     ) -> Result<Vec<u8>, GpuError> {
         let device = ctx.device()?;
         let queue = ctx.queue()?;
-        let pixel_count = (width * height) as usize;
+        let pixel_count = (width as u64 * height as u64) as usize;
 
         let packed = crate::pixel_pack::pack_u8_to_u32(pixels);
 
@@ -433,7 +443,7 @@ impl GpuConvolution {
         kernel_size: u32,
         border_mode: BorderMode,
     ) -> Result<GpuBuffer, GpuError> {
-        let pixel_count = (width * height) as usize;
+        let pixel_count = (width as u64 * height as u64) as usize;
         let buffer_size = (pixel_count * 4) as u64;
 
         let device = ctx.device()?;
@@ -493,7 +503,7 @@ fn validate_dimensions(pixels: &[u8], width: u32, height: u32) -> Result<(), Gpu
             "图像宽高必须大于 0".to_string(),
         ));
     }
-    let pixel_count = (width * height) as usize;
+    let pixel_count = (width as u64 * height as u64) as usize;
     if pixels.len() != pixel_count {
         return Err(GpuError::InvalidInput(
             "像素数量与声明尺寸不符".to_string(),

@@ -10,6 +10,12 @@ use wgpu::{
 use crate::buffer::{BufferUsage, GpuBuffer};
 use crate::error::GpuError;
 
+/// Push Constant 最大允许大小（字节）。
+///
+/// WebGPU 规范要求 Push Constant 不超过 128 字节，
+/// 超过此限制会导致 GPU 驱动错误。
+const PUSH_CONSTANT_MAX_SIZE: u32 = 128;
+
 /// 绑定类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BindingType {
@@ -81,6 +87,17 @@ impl PipelineDescriptor {
         workgroup_size: [u32; 3],
         push_constant_size: u32,
     ) -> Self {
+        assert!(
+            push_constant_size <= PUSH_CONSTANT_MAX_SIZE,
+            "Push constant 大小不能超过 {} 字节，当前为 {}",
+            PUSH_CONSTANT_MAX_SIZE,
+            push_constant_size
+        );
+        assert!(
+            push_constant_size.is_multiple_of(4),
+            "Push constant 大小必须是 4 字节对齐，当前为 {}",
+            push_constant_size
+        );
         Self {
             bindings: vec![
                 BindingType::StorageReadOnly,
@@ -100,7 +117,8 @@ const BIND_GROUP_CACHE_MAX_ENTRIES: usize = 64;
 /// BindGroup 缓存，避免每次 dispatch 重新创建。
 ///
 /// 缓存 key 为缓冲区地址列表（`wgpu::Buffer` 指针），缓存值为 `Arc<wgpu::BindGroup>`。
-/// 当缓存条目数超过 `BIND_GROUP_CACHE_MAX_ENTRIES` 时全量清空（简单淘汰策略）。
+/// 当缓存条目数达到 `BIND_GROUP_CACHE_MAX_ENTRIES` 时，采用 LRU 策略淘汰最久未访问的条目，
+/// 避免全量清空导致的性能尖峰。
 ///
 /// # 缓存有效性
 ///
@@ -109,16 +127,18 @@ const BIND_GROUP_CACHE_MAX_ENTRIES: usize = 64;
 /// （不会命中，最终被淘汰策略清除）。
 struct BindGroupCache {
     entries: RefCell<HashMap<Vec<usize>, Arc<wgpu::BindGroup>>>,
+    access_order: RefCell<Vec<Vec<usize>>>,
 }
 
 impl BindGroupCache {
     fn new() -> Self {
         Self {
             entries: RefCell::new(HashMap::new()),
+            access_order: RefCell::new(Vec::new()),
         }
     }
 
-    /// 获取或创建 BindGroup，缓存命中时返回已有实例。
+    /// 获取或创建 BindGroup，缓存命中时返回已有实例并更新访问顺序。
     fn get_or_create(
         &self,
         device: &Device,
@@ -134,7 +154,10 @@ impl BindGroupCache {
             let entries = self.entries.borrow();
             if let Some(bg) = entries.get(&buffer_ids) {
                 log::debug!("BindGroup 缓存命中: {} 个缓冲区", buffer_ids.len());
-                return Arc::clone(bg);
+                let result = Arc::clone(bg);
+                drop(entries);
+                self.touch(&buffer_ids);
+                return result;
             }
         }
 
@@ -144,17 +167,36 @@ impl BindGroupCache {
 
         {
             let mut entries = self.entries.borrow_mut();
-            if entries.len() >= BIND_GROUP_CACHE_MAX_ENTRIES {
-                log::debug!(
-                    "BindGroup 缓存已满 ({}), 清空",
-                    entries.len()
-                );
-                entries.clear();
-            }
-            entries.insert(buffer_ids, Arc::clone(&arc));
+            let mut order = self.access_order.borrow_mut();
+            Self::evict_if_needed(&mut entries, &mut order);
+            entries.insert(buffer_ids.clone(), Arc::clone(&arc));
+            order.push(buffer_ids);
         }
 
         arc
+    }
+
+    /// 更新 key 的访问顺序，将其移到最近访问位置。
+    fn touch(&self, key: &[usize]) {
+        let mut order = self.access_order.borrow_mut();
+        order.retain(|k| k != key);
+        order.push(key.to_vec());
+    }
+
+    /// LRU 淘汰：当缓存满时移除最久未访问的条目。
+    fn evict_if_needed(
+        entries: &mut HashMap<Vec<usize>, Arc<wgpu::BindGroup>>,
+        order: &mut Vec<Vec<usize>>,
+    ) {
+        while entries.len() >= BIND_GROUP_CACHE_MAX_ENTRIES {
+            if let Some(old_key) = order.first().cloned() {
+                order.remove(0);
+                entries.remove(&old_key);
+                log::debug!("LRU 淘汰 BindGroup 缓存条目");
+            } else {
+                break;
+            }
+        }
     }
 
     fn create_bind_group(
@@ -180,6 +222,7 @@ impl BindGroupCache {
 
     fn clear(&self) {
         self.entries.borrow_mut().clear();
+        self.access_order.borrow_mut().clear();
     }
 
     fn len(&self) -> usize {
@@ -321,6 +364,14 @@ impl ComputePipeline {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &*bind_group, &[]);
             if let Some(data) = push_constants {
+                let expected = self.push_constant_size.unwrap() as usize;
+                assert_eq!(
+                    data.len(),
+                    expected,
+                    "Push constant 数据长度 ({}) 与声明大小 ({}) 不匹配",
+                    data.len(),
+                    expected
+                );
                 pass.set_push_constants(0, data);
             }
             pass.dispatch_workgroups(dispatch_count[0], dispatch_count[1], dispatch_count[2]);
@@ -355,9 +406,50 @@ impl ComputePipeline {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &*bind_group, &[]);
             if let Some(data) = push_constants {
+                let expected = self.push_constant_size.unwrap() as usize;
+                assert_eq!(
+                    data.len(),
+                    expected,
+                    "Push constant 数据长度 ({}) 与声明大小 ({}) 不匹配",
+                    data.len(),
+                    expected
+                );
                 pass.set_push_constants(0, data);
             }
             pass.dispatch_workgroups(dispatch_count[0], dispatch_count[1], dispatch_count[2]);
+        }
+    }
+
+    /// 执行一次 GPU dispatch，自动根据管线配置选择 Push Constant 或 Uniform buffer 传递参数。
+    ///
+    /// 当管线使用 Push Constant 时，`params_bytes` 通过 `set_push_constants` 传递，
+    /// `storage_buffers` 直接作为绑定组；当管线使用 Uniform buffer 时，自动创建
+    /// Uniform 缓冲区并前置到绑定组。
+    ///
+    /// 此方法封装了 `push_constant_size().is_some()` 的分支判断，消除调用方重复代码。
+    pub fn dispatch_with_params(
+        &self,
+        device: &Device,
+        queue: &Queue,
+        params_bytes: &[u8],
+        storage_buffers: &[&GpuBuffer],
+        dispatch_count: [u32; 3],
+        compute_units: u32,
+    ) {
+        if self.push_constant_size.is_some() {
+            self.dispatch(
+                device,
+                queue,
+                storage_buffers,
+                dispatch_count,
+                Some(params_bytes),
+                compute_units,
+            );
+        } else {
+            let params_buffer = GpuBuffer::from_bytes(device, params_bytes, BufferUsage::Uniform);
+            let mut buffers: Vec<&GpuBuffer> = vec![&params_buffer];
+            buffers.extend(storage_buffers);
+            self.dispatch(device, queue, &buffers, dispatch_count, None, compute_units);
         }
     }
 
@@ -386,7 +478,7 @@ impl ComputePipeline {
     /// 清空此管线的 BindGroup 缓存。
     ///
     /// 当缓冲区被释放或回收后，应调用此方法清除可能失效的缓存条目。
-    /// 正常使用中无需手动调用——淘汰策略会自动清理旧条目。
+    /// 正常使用中无需手动调用——LRU 淘汰策略会自动清理最久未访问的条目。
     pub fn clear_bind_group_cache(&self) {
         self.bind_group_cache.clear();
     }
@@ -395,6 +487,21 @@ impl ComputePipeline {
     pub fn bind_group_cache_len(&self) -> usize {
         self.bind_group_cache.len()
     }
+}
+
+/// 将 Push Constant 版 WGSL 转换为 Uniform buffer 回退版。
+///
+/// 替换 `var<push_constant>` 为 `@group(0) @binding(2) var<uniform>`，
+/// 适用于不支持 Push Constant 的设备回退到 Uniform buffer 传递参数。
+///
+/// # 示例
+///
+/// ```text
+/// // 输入: var<push_constant> params: Params;
+/// // 输出: @group(0) @binding(2) var<uniform> params: Params;
+/// ```
+pub fn wgsl_push_constant_to_uniform(wgsl: &str) -> String {
+    wgsl.replace("var<push_constant>", "@group(0) @binding(2) var<uniform>")
 }
 
 /// 检查 dispatch occupancy，当总线程数远小于 CU 数量时输出低 occupancy 警告。

@@ -3,7 +3,19 @@ use std::sync::Arc;
 use crate::buffer::{BufferUsage, GpuBuffer};
 use crate::context::GpuContext;
 use crate::error::GpuError;
-use crate::pipeline::{ComputePipeline, PipelineDescriptor};
+use crate::pipeline::{ComputePipeline, PipelineDescriptor, wgsl_push_constant_to_uniform};
+
+/// 将目标宽高打包为 u32（高 16 位 = 宽，低 16 位 = 高）。
+/// 当宽或高超过 65535 时返回错误，避免移位溢出导致着色器解包出错误尺寸。
+fn pack_dst_dimensions(width: u32, height: u32) -> Result<u32, GpuError> {
+    if width > 0xFFFF || height > 0xFFFF {
+        return Err(GpuError::InvalidInput(format!(
+            "目标尺寸超出限制: {}x{}, 最大支持 65535x65535",
+            width, height
+        )));
+    }
+    Ok((width << 16) | height)
+}
 
 const RESIZE_WGSL: &str = include_str!("resize.wgsl");
 
@@ -51,14 +63,6 @@ struct ResizeParams {
 /// ResizeParams 的 Push Constant 大小（字节数）。
 const RESIZE_PUSH_CONSTANT_SIZE: u32 = std::mem::size_of::<ResizeParams>() as u32;
 
-/// 将 Push Constant 版 resize WGSL 转换为 Uniform buffer 回退版。
-fn wgsl_resize_push_constant_to_uniform(wgsl: &str) -> String {
-    wgsl.replace(
-        "var<push_constant> params: ResizeParams;",
-        "@group(0) @binding(2) var<uniform> params: ResizeParams;",
-    )
-}
-
 /// 根据设备 Push Constant 支持情况创建缩放管线描述符。
 fn resize_pipeline_descriptor(
     wgsl: &'static str,
@@ -68,7 +72,7 @@ fn resize_pipeline_descriptor(
     if push_constants_supported {
         PipelineDescriptor::push_constant_2_binding(wgsl, workgroup_size, RESIZE_PUSH_CONSTANT_SIZE)
     } else {
-        let uniform_wgsl = wgsl_resize_push_constant_to_uniform(wgsl);
+        let uniform_wgsl = wgsl_push_constant_to_uniform(wgsl);
         PipelineDescriptor::default_3_binding(uniform_wgsl, workgroup_size)
     }
 }
@@ -122,10 +126,10 @@ impl GpuResize {
 
         let (src_w, src_h) = Self::validate_batch_input(images, dimensions)?;
 
-        let src_pixels = (src_w * src_h) as usize;
+        let src_pixels = (src_w as u64 * src_h as u64) as usize;
 
         let src_u32_per_image = src_pixels as u64;
-        let dst_pixels = (target_width * target_height) as usize;
+        let dst_pixels = (target_width as u64 * target_height as u64) as usize;
         let dst_u32_per_image = dst_pixels as u64;
         let u32_per_image = src_u32_per_image + dst_u32_per_image;
 
@@ -170,6 +174,58 @@ impl GpuResize {
         )
     }
 
+    /// 执行 resize dispatch，创建输出缓冲区并提交 GPU 计算。
+    ///
+    /// 封装了输出缓冲区创建 → 参数编码 → dispatch_with_params 的公共流程，
+    /// 消除 `resize_batch_gpu_inner`、`resize_batch_gpu_from_buffer` 和
+    /// `resize_batch_inner` 之间的重复逻辑。
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_resize(
+        &self,
+        ctx: &GpuContext,
+        input_buffer: &GpuBuffer,
+        image_count: usize,
+        src_w: u32,
+        src_h: u32,
+        target_width: u32,
+        target_height: u32,
+    ) -> Result<(GpuBuffer, usize), GpuError> {
+        let device = ctx.device()?;
+        let queue = ctx.queue()?;
+        let dst_pixels = (target_width as u64 * target_height as u64) as usize;
+        let output_u32_count = image_count * dst_pixels;
+        let output_size = (output_u32_count * 4) as u64;
+
+        let output_buffer_raw = ctx
+            .buffer_pool()
+            .acquire(device, output_size, BufferUsage::Storage);
+        let output_buffer = GpuBuffer::from_raw(output_buffer_raw, output_size);
+
+        let params = ResizeParams {
+            image_count: image_count as u32,
+            src_w,
+            src_h,
+            packed_dst: pack_dst_dimensions(target_width, target_height)?,
+        };
+        let params_arr = [params];
+        let params_bytes = bytemuck::cast_slice::<ResizeParams, u8>(&params_arr);
+
+        let dispatch_x = target_width.div_ceil(self.workgroup_size[0]).max(1);
+        let dispatch_y = target_height.div_ceil(self.workgroup_size[1]).max(1);
+        let dispatch_z = image_count as u32;
+
+        self.pipeline.dispatch_with_params(
+            device,
+            queue,
+            params_bytes,
+            &[input_buffer, &output_buffer],
+            [dispatch_x, dispatch_y, dispatch_z],
+            ctx.compute_units(),
+        );
+
+        Ok((output_buffer, output_u32_count))
+    }
+
     fn resize_batch_gpu_inner(
         &self,
         ctx: &GpuContext,
@@ -182,8 +238,7 @@ impl GpuResize {
         let device = ctx.device()?;
         let queue = ctx.queue()?;
         let image_count = images.len();
-        let src_pixels = (src_w * src_h) as usize;
-        let dst_pixels = (target_width * target_height) as usize;
+        let src_pixels = (src_w as u64 * src_h as u64) as usize;
 
         let mut all_pixels: Vec<u32> = Vec::with_capacity(image_count * src_pixels);
         for img in images {
@@ -191,56 +246,19 @@ impl GpuResize {
         }
 
         let input_size = (all_pixels.len() * 4) as u64;
-        let output_u32_count = image_count * dst_pixels;
-        let output_size = (output_u32_count * 4) as u64;
-
         let input_buffer_raw = ctx
             .buffer_pool()
             .acquire(device, input_size, BufferUsage::Storage);
-        let output_buffer_raw = ctx
-            .buffer_pool()
-            .acquire(device, output_size, BufferUsage::Storage);
-
         queue.write_buffer(&input_buffer_raw, 0, bytemuck::cast_slice(&all_pixels));
-
         let input_buffer = GpuBuffer::from_raw(input_buffer_raw, input_size);
-        let output_buffer = GpuBuffer::from_raw(output_buffer_raw, output_size);
 
-        let params = ResizeParams {
-            image_count: image_count as u32,
-            src_w,
-            src_h,
-            packed_dst: (target_width << 16) | target_height,
-        };
-        let params_arr = [params];
-        let params_bytes = bytemuck::cast_slice::<ResizeParams, u8>(&params_arr);
-
-        let dispatch_x = target_width.div_ceil(self.workgroup_size[0]).max(1);
-        let dispatch_y = target_height.div_ceil(self.workgroup_size[1]).max(1);
-        let dispatch_z = image_count as u32;
-
-        if self.pipeline.push_constant_size().is_some() {
-            self.pipeline.dispatch(
-                device, queue,
-                &[&input_buffer, &output_buffer],
-                [dispatch_x, dispatch_y, dispatch_z],
-                Some(params_bytes),
-                ctx.compute_units(),
-            );
-        } else {
-            let params_buffer = GpuBuffer::from_data(device, &[params], BufferUsage::Uniform);
-            self.pipeline.dispatch(
-                device, queue,
-                &[&input_buffer, &output_buffer, &params_buffer],
-                [dispatch_x, dispatch_y, dispatch_z],
-                None,
-                ctx.compute_units(),
-            );
-        }
+        let result = self.dispatch_resize(
+            ctx, &input_buffer, image_count, src_w, src_h, target_width, target_height,
+        )?;
 
         ctx.buffer_pool().release(input_buffer.into_raw(), BufferUsage::Storage);
 
-        Ok((output_buffer, output_u32_count))
+        Ok(result)
     }
 
     /// 从 GPU buffer 输入执行批量缩放，返回 GPU buffer（零拷贝流水线）。
@@ -262,50 +280,13 @@ impl GpuResize {
             return Err(GpuError::InvalidInput("图像数量为 0".to_string()));
         }
 
-        let device = ctx.device()?;
-        let queue = ctx.queue()?;
-        let dst_pixels = (target_width * target_height) as usize;
-        let output_u32_count = image_count * dst_pixels;
-        let output_size = (output_u32_count * 4) as u64;
-
-        let output_buffer_raw = ctx
-            .buffer_pool()
-            .acquire(device, output_size, BufferUsage::Storage);
-        let output_buffer = GpuBuffer::from_raw(output_buffer_raw, output_size);
-
-        let params = ResizeParams {
-            image_count: image_count as u32,
-            src_w,
-            src_h,
-            packed_dst: (target_width << 16) | target_height,
-        };
-        let params_arr = [params];
-        let params_bytes = bytemuck::cast_slice::<ResizeParams, u8>(&params_arr);
-
-        let dispatch_x = target_width.div_ceil(self.workgroup_size[0]).max(1);
-        let dispatch_y = target_height.div_ceil(self.workgroup_size[1]).max(1);
-        let dispatch_z = image_count as u32;
-
-        if self.pipeline.push_constant_size().is_some() {
-            self.pipeline.dispatch(
-                device, queue,
-                &[input_buffer, &output_buffer],
-                [dispatch_x, dispatch_y, dispatch_z],
-                Some(params_bytes),
-                ctx.compute_units(),
-            );
-        } else {
-            let params_buffer = GpuBuffer::from_data(device, &[params], BufferUsage::Uniform);
-            self.pipeline.dispatch(
-                device, queue,
-                &[input_buffer, &output_buffer, &params_buffer],
-                [dispatch_x, dispatch_y, dispatch_z],
-                None,
-                ctx.compute_units(),
-            );
+        if target_width == 0 || target_height == 0 {
+            return Err(GpuError::InvalidInput("目标尺寸不能为零".to_string()));
         }
 
-        Ok((output_buffer, output_u32_count))
+        self.dispatch_resize(
+            ctx, input_buffer, image_count, src_w, src_h, target_width, target_height,
+        )
     }
 
     fn validate_batch_input(
@@ -318,7 +299,7 @@ impl GpuResize {
             ));
         }
         let (src_w, src_h) = dimensions[0];
-        let src_pixels = (src_w * src_h) as usize;
+        let src_pixels = (src_w as u64 * src_h as u64) as usize;
         for (i, img) in images.iter().enumerate() {
             if dimensions[i] != (src_w, src_h) {
                 return Err(GpuError::InvalidInput(
@@ -347,65 +328,13 @@ impl GpuResize {
         let device = ctx.device()?;
         let queue = ctx.queue()?;
         let image_count = images.len();
-        let src_pixels = (src_w * src_h) as usize;
-        let dst_pixels = (target_width * target_height) as usize;
+        let dst_pixels = (target_width as u64 * target_height as u64) as usize;
 
-        let mut all_pixels: Vec<u32> = Vec::with_capacity(image_count * src_pixels);
-        for img in images {
-            all_pixels.extend(crate::pixel_pack::pack_u8_to_u32(img));
-        }
-
-        let input_size = (all_pixels.len() * 4) as u64;
-        let output_u32_count = image_count * dst_pixels;
-        let output_size = (output_u32_count * 4) as u64;
-
-        let input_buffer_raw = ctx
-            .buffer_pool()
-            .acquire(device, input_size, BufferUsage::Storage);
-        let output_buffer_raw = ctx
-            .buffer_pool()
-            .acquire(device, output_size, BufferUsage::Storage);
-
-        queue.write_buffer(&input_buffer_raw, 0, bytemuck::cast_slice(&all_pixels));
-
-        let input_buffer = GpuBuffer::from_raw(input_buffer_raw, input_size);
-        let output_buffer = GpuBuffer::from_raw(output_buffer_raw, output_size);
-
-        let params = ResizeParams {
-            image_count: image_count as u32,
-            src_w,
-            src_h,
-            packed_dst: (target_width << 16) | target_height,
-        };
-        let params_arr = [params];
-        let params_bytes = bytemuck::cast_slice::<ResizeParams, u8>(&params_arr);
-
-        let dispatch_x = target_width.div_ceil(self.workgroup_size[0]).max(1);
-        let dispatch_y = target_height.div_ceil(self.workgroup_size[1]).max(1);
-        let dispatch_z = image_count as u32;
-
-        if self.pipeline.push_constant_size().is_some() {
-            self.pipeline.dispatch(
-                device, queue,
-                &[&input_buffer, &output_buffer],
-                [dispatch_x, dispatch_y, dispatch_z],
-                Some(params_bytes),
-                ctx.compute_units(),
-            );
-        } else {
-            let params_buffer = GpuBuffer::from_data(device, &[params], BufferUsage::Uniform);
-            self.pipeline.dispatch(
-                device, queue,
-                &[&input_buffer, &output_buffer, &params_buffer],
-                [dispatch_x, dispatch_y, dispatch_z],
-                None,
-                ctx.compute_units(),
-            );
-        }
+        let (output_buffer, _) = self.resize_batch_gpu_inner(
+            ctx, images, src_w, src_h, target_width, target_height,
+        )?;
 
         let result = output_buffer.download_with_pool(device, queue, ctx.buffer_pool())?;
-
-        ctx.buffer_pool().release(input_buffer.into_raw(), BufferUsage::Storage);
         ctx.buffer_pool().release(output_buffer.into_raw(), BufferUsage::Storage);
 
         let raw_u32 = bytemuck::cast_slice::<u8, u32>(&result);

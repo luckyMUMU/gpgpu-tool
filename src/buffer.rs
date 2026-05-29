@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use wgpu::util::DeviceExt;
 use wgpu::{Buffer, BufferUsages, Device, Queue};
 
@@ -64,22 +66,30 @@ pub struct GpuBuffer {
     size: u64,
 }
 
-/// 将大小向上取整到 256 字节对齐。
-const fn align256(size: u64) -> u64 {
-    (size + 255) & !255
+/// 按缓冲区用途计算对齐后的大小。
+///
+/// - Uniform: 16 字节对齐（满足 std140 布局要求）
+/// - 其他（Storage 等）: 256 字节对齐（GPU 最佳实践）
+const fn align_for_usage(size: u64, usage: BufferUsage) -> u64 {
+    match usage {
+        BufferUsage::Uniform => (size + 15) & !15,
+        _ => (size + 255) & !255,
+    }
 }
 
-/// 将数据填充到 256 字节对齐，返回填充后的 Vec<u8>。
-/// 如果数据已经是 256 字节对齐，返回 None（无需填充）。
-fn pad_to_256(data: &[u8]) -> Option<Vec<u8>> {
-    let aligned = align256(data.len() as u64);
-    let padding = aligned as usize - data.len();
-    if padding == 0 {
-        return None;
+/// 按缓冲区用途填充数据到对齐大小。
+///
+/// 如果数据已满足对齐要求，返回 `Cow::Borrowed`（零拷贝）；
+/// 否则填充零字节并返回 `Cow::Owned`。
+fn pad_for_usage(data: &[u8], usage: BufferUsage) -> Cow<'_, [u8]> {
+    let aligned_size = align_for_usage(data.len() as u64, usage) as usize;
+    if data.len() == aligned_size {
+        Cow::Borrowed(data)
+    } else {
+        let mut padded = data.to_vec();
+        padded.resize(aligned_size, 0);
+        Cow::Owned(padded)
     }
-    let mut padded = data.to_vec();
-    padded.resize(aligned as usize, 0);
-    Some(padded)
 }
 
 impl GpuBuffer {
@@ -89,15 +99,14 @@ impl GpuBuffer {
     /// 适用于纯输入缓冲区（如参数 buffer）。
     /// 如需下载，请使用 [`from_data_readable`](GpuBuffer::from_data_readable)。
     ///
-    /// 缓冲区大小会向上取整到 256 字节对齐，符合 GPU Storage Buffer 最佳实践。
+    /// 缓冲区大小按用途对齐：Uniform 16 字节，Storage 256 字节。
     pub fn from_data<T: bytemuck::Pod>(device: &Device, data: &[T], usage: BufferUsage) -> Self {
         let bytes = bytemuck::cast_slice(data);
         let size = bytes.len() as u64;
-        let padded = pad_to_256(bytes);
-        let contents: &[u8] = padded.as_deref().unwrap_or(bytes);
+        let contents = pad_for_usage(bytes, usage);
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("GpuBuffer::from_data"),
-            contents,
+            contents: &contents,
             usage: usage.to_wgpu_usage(false),
         });
         Self { buffer, size }
@@ -109,15 +118,14 @@ impl GpuBuffer {
     /// 允许缓冲区内容通过 [`download`](GpuBuffer::download) 下载回 CPU。
     /// 仅在需要回读数据时使用，避免浪费 GPU 资源配额。
     ///
-    /// 缓冲区大小会向上取整到 256 字节对齐，符合 GPU Storage Buffer 最佳实践。
+    /// 缓冲区大小按用途对齐：Uniform 16 字节，Storage 256 字节。
     pub fn from_data_readable<T: bytemuck::Pod>(device: &Device, data: &[T], usage: BufferUsage) -> Self {
         let bytes = bytemuck::cast_slice(data);
         let size = bytes.len() as u64;
-        let padded = pad_to_256(bytes);
-        let contents: &[u8] = padded.as_deref().unwrap_or(bytes);
+        let contents = pad_for_usage(bytes, usage);
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("GpuBuffer::from_data_readable"),
-            contents,
+            contents: &contents,
             usage: usage.to_wgpu_usage(true),
         });
         Self { buffer, size }
@@ -128,14 +136,13 @@ impl GpuBuffer {
     /// 创建的缓冲区**不支持**下载回 CPU（无 `COPY_SRC` 标志）。
     /// 如需下载，请使用 [`from_bytes_readable`](GpuBuffer::from_bytes_readable)。
     ///
-    /// 缓冲区大小会向上取整到 256 字节对齐，符合 GPU Storage Buffer 最佳实践。
+    /// 缓冲区大小按用途对齐：Uniform 16 字节，Storage 256 字节。
     pub fn from_bytes(device: &Device, data: &[u8], usage: BufferUsage) -> Self {
         let size = data.len() as u64;
-        let padded = pad_to_256(data);
-        let contents: &[u8] = padded.as_deref().unwrap_or(data);
+        let contents = pad_for_usage(data, usage);
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("GpuBuffer::from_bytes"),
-            contents,
+            contents: &contents,
             usage: usage.to_wgpu_usage(false),
         });
         Self { buffer, size }
@@ -147,14 +154,13 @@ impl GpuBuffer {
     /// 允许缓冲区内容通过 [`download`](GpuBuffer::download) 下载回 CPU。
     /// 仅在需要回读数据时使用，避免浪费 GPU 资源配额。
     ///
-    /// 缓冲区大小会向上取整到 256 字节对齐，符合 GPU Storage Buffer 最佳实践。
+    /// 缓冲区大小按用途对齐：Uniform 16 字节，Storage 256 字节。
     pub fn from_bytes_readable(device: &Device, data: &[u8], usage: BufferUsage) -> Self {
         let size = data.len() as u64;
-        let padded = pad_to_256(data);
-        let contents: &[u8] = padded.as_deref().unwrap_or(data);
+        let contents = pad_for_usage(data, usage);
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("GpuBuffer::from_bytes_readable"),
-            contents,
+            contents: &contents,
             usage: usage.to_wgpu_usage(true),
         });
         Self { buffer, size }
@@ -166,9 +172,9 @@ impl GpuBuffer {
     /// 适用于纯输出或中间缓冲区（无需回读）。
     /// 如需下载，请使用 [`empty_readable`](GpuBuffer::empty_readable)。
     ///
-    /// 缓冲区大小会向上取整到 256 字节对齐，符合 GPU Storage Buffer 最佳实践。
+    /// 缓冲区大小按用途对齐：Uniform 16 字节，Storage 256 字节。
     pub fn empty(device: &Device, size: u64, usage: BufferUsage) -> Self {
-        let aligned_size = align256(size);
+        let aligned_size = align_for_usage(size, usage);
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("GpuBuffer::empty"),
             size: aligned_size,
@@ -184,9 +190,9 @@ impl GpuBuffer {
     /// 允许缓冲区内容通过 [`download`](GpuBuffer::download) 下载回 CPU。
     /// 仅在需要回读计算结果时使用，避免浪费 GPU 资源配额。
     ///
-    /// 缓冲区大小会向上取整到 256 字节对齐，符合 GPU Storage Buffer 最佳实践。
+    /// 缓冲区大小按用途对齐：Uniform 16 字节，Storage 256 字节。
     pub fn empty_readable(device: &Device, size: u64, usage: BufferUsage) -> Self {
-        let aligned_size = align256(size);
+        let aligned_size = align_for_usage(size, usage);
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("GpuBuffer::empty_readable"),
             size: aligned_size,
@@ -254,6 +260,10 @@ impl GpuBuffer {
         queue: &Queue,
         pool: &BufferPool,
     ) -> Result<Vec<u8>, GpuError> {
+        if self.size == 0 {
+            return Ok(vec![]);
+        }
+
         let staging = pool.acquire_staging(device, self.size);
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {

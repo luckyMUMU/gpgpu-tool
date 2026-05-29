@@ -1,5 +1,5 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use wgpu::{Buffer, BufferUsages, Device};
 
@@ -100,8 +100,8 @@ impl BufferPool {
 /// pool.release(buf, BufferUsage::Storage);
 /// ```
 pub struct BufferPool {
-    pools: RefCell<HashMap<PoolKey, Vec<Buffer>>>,
-    staging_pools: RefCell<HashMap<u64, Vec<Buffer>>>,
+    pools: Mutex<HashMap<PoolKey, Vec<Buffer>>>,
+    staging_pools: Mutex<HashMap<u64, Vec<Buffer>>>,
     config: BufferPoolConfig,
 }
 
@@ -114,8 +114,8 @@ impl BufferPool {
     /// 创建指定配置的缓冲区池。
     pub fn with_config(config: BufferPoolConfig) -> Self {
         Self {
-            pools: RefCell::new(HashMap::new()),
-            staging_pools: RefCell::new(HashMap::new()),
+            pools: Mutex::new(HashMap::new()),
+            staging_pools: Mutex::new(HashMap::new()),
             config,
         }
     }
@@ -131,7 +131,7 @@ impl BufferPool {
         let class = self.size_class(aligned);
         let key = PoolKey { size_class: class, usage };
 
-        let mut pools = self.pools.borrow_mut();
+        let mut pools = self.pools.lock().unwrap();
         if let Some(buffers) = pools.get_mut(&key) {
             if let Some(buf) = buffers.pop() {
                 log::debug!("缓冲区池命中: class={}, usage={:?}", class, usage);
@@ -163,7 +163,7 @@ impl BufferPool {
             usage,
         };
 
-        let mut pools = self.pools.borrow_mut();
+        let mut pools = self.pools.lock().unwrap();
         let entry = pools.entry(key).or_default();
         if entry.len() < self.config.max_per_class {
             entry.push(buffer);
@@ -172,7 +172,7 @@ impl BufferPool {
 
     #[doc(hidden)]
     pub fn acquire_staging(&self, device: &Device, size: u64) -> Buffer {
-        let mut pools = self.staging_pools.borrow_mut();
+        let mut pools = self.staging_pools.lock().unwrap();
         if let Some(buffers) = pools.get_mut(&size) {
             if let Some(buf) = buffers.pop() {
                 return buf;
@@ -193,7 +193,7 @@ impl BufferPool {
         if size > self.config.release_threshold {
             return;
         }
-        let mut pools = self.staging_pools.borrow_mut();
+        let mut pools = self.staging_pools.lock().unwrap();
         let entry = pools.entry(size).or_default();
         if entry.len() < self.config.max_per_class {
             entry.push(buffer);

@@ -269,7 +269,7 @@ impl PerceptualHasher {
             let mut buffers = Vec::with_capacity(images.len());
             for (i, image) in images.iter().enumerate() {
                 let (w, h) = dimensions[i];
-                let src_pixels = (w * h) as usize;
+                let src_pixels = (w as u64 * h as u64) as usize;
                 let input_buffer = upload_image_to_gpu(ctx, image, w, h)?;
                 let blurred = gpu_blur.blur_gpu(
                     ctx, &input_buffer, src_pixels, w, h, kernel_size, sigma,
@@ -344,7 +344,7 @@ impl PerceptualHasher {
             return Err(GpuError::InvalidInput("图像列表为空".to_string()));
         }
 
-        let src_pixels = (src_width * src_height) as usize;
+        let src_pixels = (src_width as u64 * src_height as u64) as usize;
 
         if image_count == 1 {
             return gpu_resize.resize_batch_gpu_from_buffer(
@@ -551,8 +551,8 @@ impl PerceptualHasher {
         all_target_size: bool,
     ) -> Result<Vec<u64>, GpuError> {
         let (src_w, src_h) = dimensions[0];
-        let src_pixels = (src_w * src_h) as usize;
-        let dst_pixels = (self.target_width * self.target_height) as usize;
+        let src_pixels = (src_w as u64 * src_h as u64) as usize;
+        let dst_pixels = (self.target_width as u64 * self.target_height as u64) as usize;
         let src_u32_per_image = src_pixels as u64;
         let dst_u32_per_image = dst_pixels as u64;
         let u32_per_image = if all_target_size {
@@ -614,7 +614,7 @@ impl PerceptualHasher {
 
             if w == self.target_width && h == self.target_height {
                 // 已缩放（有模糊），直接计算哈希
-                let src_pixels = (w * h) as usize;
+                let src_pixels = (w as u64 * h as u64) as usize;
                 let hashes = self.compute_hash_gpu(ctx, &gpu_images[0], src_pixels, 1)?;
                 release_buffers(ctx, gpu_images);
                 all_hashes.extend(hashes);
@@ -669,9 +669,16 @@ fn release_buffers(ctx: &GpuContext, buffers: Vec<GpuBuffer>) {
 fn upload_image_to_gpu(
     ctx: &GpuContext,
     image: &[u8],
-    _width: u32,
-    _height: u32,
+    width: u32,
+    height: u32,
 ) -> Result<GpuBuffer, GpuError> {
+    let expected_len = (width as usize) * (height as usize);
+    if image.len() != expected_len {
+        return Err(GpuError::InvalidInput(format!(
+            "图像数据长度 ({}) 与声明的尺寸 ({}x{}={}) 不匹配",
+            image.len(), width, height, expected_len
+        )));
+    }
     let device = ctx.device()?;
     let queue = ctx.queue()?;
     let packed = crate::pixel_pack::pack_u8_to_u32(image);
@@ -737,7 +744,7 @@ fn resize_grayscale(
 
     let x_ratio = src_w as f64 / dst_w as f64;
     let y_ratio = src_h as f64 / dst_h as f64;
-    let mut output = Vec::with_capacity((dst_w * dst_h) as usize);
+    let mut output = Vec::with_capacity((dst_w as u64 * dst_h as u64) as usize);
 
     for dy in 0..dst_h {
         let y0 = (dy as f64 * y_ratio) as usize;

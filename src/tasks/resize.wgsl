@@ -18,6 +18,8 @@ var<push_constant> params: ResizeParams;
 
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    // packed_dst: 高 16 位 = 目标宽度, 低 16 位 = 目标高度
+    // 最大支持 65535×65535，Rust 端 pack_dst_dimensions() 已做溢出校验
     let dst_wh = params.packed_dst;
     let dst_w = dst_wh >> 16u;
     let dst_h = dst_wh & 0xFFFFu;

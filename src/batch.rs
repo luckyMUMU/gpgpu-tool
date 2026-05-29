@@ -3,6 +3,7 @@ use std::sync::Arc;
 use wgpu::{Buffer, CommandEncoder};
 
 use crate::buffer::GpuBuffer;
+use crate::buffer_pool::BufferPool;
 use crate::error::GpuError;
 use crate::pipeline::{BindingType, ComputePipeline};
 
@@ -44,6 +45,7 @@ pub struct GpuBatchSubmitter {
     pending: Vec<PendingJob>,
     device: Option<wgpu::Device>,
     queue: Option<wgpu::Queue>,
+    pool: Option<Arc<BufferPool>>,
 }
 
 impl GpuBatchSubmitter {
@@ -54,6 +56,7 @@ impl GpuBatchSubmitter {
             pending: Vec::new(),
             device: None,
             queue: None,
+            pool: None,
         }
     }
 
@@ -81,6 +84,7 @@ impl GpuBatchSubmitter {
             ));
             self.device = Some(device.clone());
             self.queue = Some(queue.clone());
+            self.pool = Some(ctx.buffer_pool_arc());
         }
 
         let encoder = self.encoder.as_mut().unwrap();
@@ -157,15 +161,41 @@ impl GpuBatchSubmitter {
 
         device.poll(wgpu::Maintain::Wait);
 
-        // 验证所有映射成功
+        // 验证所有映射成功，同时记录映射状态以便错误路径清理
+        let mut map_succeeded = Vec::with_capacity(self.pending.len());
+        let mut first_error: Option<GpuError> = None;
+
         for rx in &map_rxs {
-            match rx
-                .recv()
-                .map_err(|_| GpuError::MapFailed("批量映射通道关闭".into()))?
-            {
-                Ok(()) => {}
-                Err(e) => return Err(GpuError::MapFailed(format!("批量映射失败: {}", e))),
+            let succeeded = match rx.recv() {
+                Ok(Ok(())) => true,
+                Ok(Err(ref e)) if first_error.is_none() => {
+                    first_error = Some(GpuError::MapFailed(format!("批量映射失败: {}", e)));
+                    false
+                }
+                Ok(Err(_)) => false,
+                Err(_) if first_error.is_none() => {
+                    first_error = Some(GpuError::MapFailed("批量映射通道关闭".into()));
+                    false
+                }
+                Err(_) => false,
+            };
+            map_succeeded.push(succeeded);
+        }
+
+        if let Some(e) = first_error {
+            // 错误路径：unmap 已映射的 staging buffer，归还所有到 pool
+            for (i, pending) in self.pending.iter().enumerate() {
+                if map_succeeded[i] {
+                    pending.staging_buffer.unmap();
+                }
             }
+            for pending in self.pending.drain(..) {
+                ctx.buffer_pool().release_staging(pending.staging_buffer);
+            }
+            self.device = None;
+            self.queue = None;
+            self.pool = None;
+            return Err(e);
         }
 
         for pending in self.pending.drain(..) {
@@ -179,6 +209,7 @@ impl GpuBatchSubmitter {
 
         self.device = None;
         self.queue = None;
+        self.pool = None;
 
         Ok(results)
     }
@@ -189,11 +220,19 @@ impl GpuBatchSubmitter {
     }
 
     /// 清空所有待处理任务（不获取结果，直接丢弃）。
+    ///
+    /// staging buffer 会归还到 BufferPool 以便复用。
     pub fn clear(&mut self) {
+        if let Some(pool) = self.pool.as_ref() {
+            for pending in self.pending.drain(..) {
+                pool.release_staging(pending.staging_buffer);
+            }
+        }
         self.pending.clear();
         self.encoder = None;
         self.device = None;
         self.queue = None;
+        self.pool = None;
     }
 }
 

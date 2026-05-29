@@ -107,7 +107,7 @@ impl Default for PHasherCpu {
 ///
 /// 使用 f32 均值，像素 >= 均值生成 1bit。
 fn mean_hash_cpu(pixels: &[u8], width: u32, height: u32, hash_bits: usize) -> Vec<u32> {
-    let pixels_per_image = (width * height) as usize;
+    let pixels_per_image = (width as u64 * height as u64) as usize;
     let u32s_per_image = hash_bits.div_ceil(32);
     let total_bits = hash_bits.min(pixels_per_image);
 
@@ -127,7 +127,7 @@ fn mean_hash_cpu(pixels: &[u8], width: u32, height: u32, hash_bits: usize) -> Ve
 ///
 /// 使用直方图中值算法，像素 > 中值生成 1bit。
 fn median_hash_cpu(pixels: &[u8], width: u32, height: u32, hash_bits: usize) -> Vec<u32> {
-    let pixels_per_image = (width * height) as usize;
+    let pixels_per_image = (width as u64 * height as u64) as usize;
     let u32s_per_image = hash_bits.div_ceil(32);
     let total_bits = hash_bits.min(pixels_per_image);
 
@@ -162,13 +162,14 @@ fn gradient_hash_cpu(pixels: &[u8], width: u32, height: u32, hash_bits: usize) -
     let u32s_per_image = hash_bits.div_ceil(32);
     let mut hash_u32s = vec![0u32; u32s_per_image];
     let mut bit_pos: usize = 0;
+    let width_usize = width as usize;
 
     for row in 0..height {
         for col in 0..(width - 1) {
             if bit_pos >= hash_bits {
                 break;
             }
-            let idx = (row * width + col) as usize;
+            let idx = row as usize * width_usize + col as usize;
             let current = pixels[idx];
             let next = pixels[idx + 1];
             if next > current {
@@ -194,7 +195,7 @@ fn vert_gradient_hash_cpu(pixels: &[u8], width: u32, height: u32, hash_bits: usi
             if bit_pos >= hash_bits {
                 break;
             }
-            let idx = (row * width + col) as usize;
+            let idx = row as usize * width_usize + col as usize;
             let current = pixels[idx];
             let below = pixels[idx + width_usize];
             if below > current {
@@ -222,8 +223,9 @@ fn block_hash_cpu(
     let block_w = width / blocks_x;
     let block_h = height / blocks_y;
     let u32s_per_image = hash_bits.div_ceil(32);
+    let width_usize = width as usize;
 
-    let mut block_means = Vec::with_capacity((blocks_x * blocks_y) as usize);
+    let mut block_means = Vec::with_capacity((blocks_x as u64 * blocks_y as u64) as usize);
     for by in 0..blocks_y {
         for bx in 0..blocks_x {
             let mut sum: u32 = 0;
@@ -231,11 +233,12 @@ fn block_hash_cpu(
                 for dx in 0..block_w {
                     let px = bx * block_w + dx;
                     let py = by * block_h + dy;
-                    let idx = (py * width + px) as usize;
+                    let idx = py as usize * width_usize + px as usize;
                     sum += pixels[idx] as u32;
                 }
             }
-            let mean = sum / (block_w * block_h);
+            let block_area = block_w as u64 * block_h as u64;
+            let mean = (sum as u64 / block_area) as u32;
             block_means.push(mean);
         }
     }
@@ -302,7 +305,7 @@ fn double_gradient_hash_cpu(
             if bit_pos >= h_limit {
                 break;
             }
-            let idx = (row * width + col) as usize;
+            let idx = row as usize * width_usize + col as usize;
             let current = pixels[idx];
             let next = pixels[idx + 1];
             if next > current {
@@ -317,7 +320,7 @@ fn double_gradient_hash_cpu(
             if bit_pos >= hash_bits {
                 break;
             }
-            let idx = (row * width + col) as usize;
+            let idx = row as usize * width_usize + col as usize;
             let current = pixels[idx];
             let below = pixels[idx + width_usize];
             if below > current {

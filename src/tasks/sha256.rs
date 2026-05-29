@@ -30,6 +30,7 @@ const BLOCK_SIZE: usize = 64;
 const BLOCK_U32_COUNT: usize = 16;
 const HASH_U32_COUNT: usize = 8;
 const MAX_SINGLE_BLOCK_MSG_LEN: usize = 55;
+const MAX_CACHED_PARAMS: usize = 16;
 
 /// SHA-256 并行哈希计算器，基于 GPU compute shader 实现。
 ///
@@ -55,6 +56,7 @@ pub struct Sha256Computer {
     pipeline_chained: Arc<ComputePipeline>,
     workgroup_size: [u32; 3],
     cached_single_block_params: RefCell<HashMap<u32, GpuBuffer>>,
+    cached_params_order: RefCell<Vec<u32>>,
 }
 
 /// SHA-256 异步批量提交器，真批量提交实现。
@@ -89,8 +91,10 @@ struct PendingBatch {
     output_buffer: GpuBuffer,
     staging_buffer: wgpu::Buffer,
     is_single_block: bool,
-    /// 延迟释放的 input buffer（raw wgpu::Buffer），在 wait_all 提交后才释放
+    /// 延迟释放的 input buffer（raw wgpu::Buffer），在 wait_all 提交后才归还 pool
     input_buffers_to_release: Vec<wgpu::Buffer>,
+    /// 非 pool 分配的缓冲区，仅需保持存活到 wait_all 提交完成后自然 Drop
+    buffers_to_keep_alive: Vec<wgpu::Buffer>,
 }
 
 impl Sha256Computer {
@@ -126,6 +130,7 @@ impl Sha256Computer {
             pipeline_chained,
             workgroup_size,
             cached_single_block_params: RefCell::new(HashMap::new()),
+            cached_params_order: RefCell::new(Vec::new()),
         })
     }
 
@@ -254,7 +259,7 @@ impl Sha256Computer {
             ctx.compute_units(),
         );
 
-        let result = output_buffer.download(device, queue)?;
+        let result = output_buffer.download_with_pool(device, queue, ctx.buffer_pool())?;
 
         ctx.buffer_pool().release(input_buffer.into_raw(), BufferUsage::Storage);
         ctx.buffer_pool().release(output_buffer.into_raw(), BufferUsage::Storage);
@@ -280,9 +285,22 @@ impl Sha256Computer {
         message_count: u32,
     ) -> GpuBuffer {
         let mut cache = self.cached_single_block_params.borrow_mut();
+        let mut order = self.cached_params_order.borrow_mut();
+
         if let Some(buf) = cache.get(&message_count) {
+            // 命中：将 key 移到访问顺序末尾（最近使用）
+            order.retain(|&k| k != message_count);
+            order.push(message_count);
             buf.clone()
         } else {
+            // 未命中且缓存已满：淘汰最久未使用的条目
+            while cache.len() >= MAX_CACHED_PARAMS {
+                if let Some(lru_key) = order.first().copied() {
+                    order.remove(0);
+                    cache.remove(&lru_key);
+                }
+            }
+
             let params = Sha256Params {
                 message_count,
                 block_mode: 0,
@@ -290,6 +308,7 @@ impl Sha256Computer {
             };
             let buf = GpuBuffer::from_data(device, &[params], BufferUsage::Uniform);
             cache.insert(message_count, buf.clone());
+            order.push(message_count);
             buf
         }
     }
@@ -349,7 +368,7 @@ impl Sha256Computer {
             ctx.compute_units(),
         );
 
-        let result = output_buffer.download(device, queue)?;
+        let result = output_buffer.download_with_pool(device, queue, ctx.buffer_pool())?;
         ctx.buffer_pool().release(input_buffer.into_raw(), BufferUsage::Storage);
         ctx.buffer_pool().release(output_buffer.into_raw(), BufferUsage::Storage);
 
@@ -430,26 +449,65 @@ impl<'a> Sha256BatchSubmitter<'a> {
 
         self.device.poll(wgpu::Maintain::Wait);
 
-        // 验证所有 staging buffer 映射成功
+        // 验证所有 staging buffer 映射成功，同时记录映射状态以便错误路径清理
+        let mut map_succeeded = Vec::with_capacity(map_receivers.len());
+        let mut first_error: Option<GpuError> = None;
+
         for recv in &map_receivers {
-            match recv
-                .recv()
-                .map_err(|_| GpuError::MapFailed("批量映射通道关闭，GPU 设备可能已丢失".into()))?
-            {
-                Ok(()) => {}
-                Err(e) => return Err(GpuError::MapFailed(format!("批量 staging buffer 映射失败: {}", e))),
+            let succeeded = match recv.recv() {
+                Ok(Ok(())) => true,
+                Ok(Err(ref e)) if first_error.is_none() => {
+                    first_error = Some(GpuError::MapFailed(format!("批量 staging buffer 映射失败: {}", e)));
+                    false
+                }
+                Ok(Err(_)) => false,
+                Err(_) if first_error.is_none() => {
+                    first_error = Some(GpuError::MapFailed("批量映射通道关闭，GPU 设备可能已丢失".into()));
+                    false
+                }
+                Err(_) => false,
+            };
+            map_succeeded.push(succeeded);
+        }
+
+        if let Some(e) = first_error {
+            // 错误路径：unmap 已映射的 staging buffer，归还所有资源到 pool
+            for (i, pending) in self.pending_batches.iter().enumerate() {
+                if map_succeeded[i] {
+                    pending.staging_buffer.unmap();
+                }
             }
+            for pending in self.pending_batches.drain(..) {
+                self.ctx.buffer_pool().release_staging(pending.staging_buffer);
+                self.ctx.buffer_pool().release(pending.output_buffer.into_raw(), BufferUsage::Storage);
+                for input_buf in pending.input_buffers_to_release {
+                    self.ctx.buffer_pool().release(input_buf, BufferUsage::Storage);
+                }
+                drop(pending.buffers_to_keep_alive);
+            }
+            return Err(e);
         }
 
         for pending in self.pending_batches.drain(..) {
-            let view = pending.staging_buffer.slice(..).get_mapped_range();
+            let PendingBatch {
+                message_count: _,
+                original_indices,
+                output_buffer,
+                staging_buffer,
+                is_single_block,
+                input_buffers_to_release,
+                buffers_to_keep_alive,
+            } = pending;
+
+            let view = staging_buffer.slice(..).get_mapped_range();
             let data = view.to_vec();
             drop(view);
-            pending.staging_buffer.unmap();
+            staging_buffer.unmap();
+            self.ctx.buffer_pool().release_staging(staging_buffer);
 
             let raw_u32 = bytemuck::cast_slice::<u8, u32>(&data);
-            if pending.is_single_block {
-                for (batch_i, &orig_i) in pending.original_indices.iter().enumerate() {
+            if is_single_block {
+                for (batch_i, &orig_i) in original_indices.iter().enumerate() {
                     let mut hash = [0u8; 32];
                     for j in 0..HASH_U32_COUNT {
                         let w = raw_u32[batch_i * HASH_U32_COUNT + j];
@@ -463,14 +521,14 @@ impl<'a> Sha256BatchSubmitter<'a> {
                     let w = raw_u32[j];
                     hash[j * 4..(j + 1) * 4].copy_from_slice(&w.to_be_bytes());
                 }
-                results.push((pending.original_indices[0], hash));
+                results.push((original_indices[0], hash));
             }
 
-            self.ctx.buffer_pool().release(pending.output_buffer.into_raw(), BufferUsage::Storage);
-            // 释放延迟持有的 input buffers
-            for input_buf in pending.input_buffers_to_release {
+            self.ctx.buffer_pool().release(output_buffer.into_raw(), BufferUsage::Storage);
+            for input_buf in input_buffers_to_release {
                 self.ctx.buffer_pool().release(input_buf, BufferUsage::Storage);
             }
+            drop(buffers_to_keep_alive);
         }
 
         Ok(results)
@@ -542,13 +600,8 @@ impl<'a> Sha256BatchSubmitter<'a> {
             self.ctx.compute_units(),
         );
 
-        // 编码 copy 到 staging buffer
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("sha256_batch_staging"),
-            size: output_size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        // 编码 copy 到 staging buffer（从 BufferPool 获取）
+        let staging = self.ctx.buffer_pool().acquire_staging(self.device, output_size);
         encoder.copy_buffer_to_buffer(output_buffer.raw(), 0, &staging, 0, output_size);
 
         // 延迟释放 input buffer，防止在 encoder 提交前被 pool 复用
@@ -561,6 +614,7 @@ impl<'a> Sha256BatchSubmitter<'a> {
             staging_buffer: staging,
             is_single_block: true,
             input_buffers_to_release: vec![input_raw],
+            buffers_to_keep_alive: vec![],
         });
 
         Ok(())
@@ -609,18 +663,16 @@ impl<'a> Sha256BatchSubmitter<'a> {
             self.ctx.compute_units(),
         );
 
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("sha256_chained_stg"), size: output_size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let staging = self.ctx.buffer_pool().acquire_staging(self.device, output_size);
         encoder.copy_buffer_to_buffer(output_gpu.raw(), 0, &staging, 0, output_size);
 
         // 延迟释放 input buffer，防止在 encoder 提交前被 pool 复用
+        // params_buf 和 prefix_sum_buf 非 pool 分配，需保持存活到 wait_all 后自然 Drop
         self.pending_batches.push(PendingBatch {
             message_count: 1, original_indices: vec![original_index],
             output_buffer: output_gpu, staging_buffer: staging, is_single_block: false,
             input_buffers_to_release: vec![input_buf_raw],
+            buffers_to_keep_alive: vec![params_buf.into_raw(), prefix_sum_buf.into_raw()],
         });
         Ok(())
     }

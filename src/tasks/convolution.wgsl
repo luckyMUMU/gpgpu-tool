@@ -26,6 +26,8 @@ var<storage, read_write> output: array<u32>;
 var<storage, read> params: ConvParams;
 
 // LDS 共享内存：存储水平卷积中间结果（含垂直 pass 所需的 halo 行）
+// LDS 大小 = (WG_Y + 2 * MAX_RADIUS) * WG_X = (8 + 2*5) * 8 = 144
+// 如果修改 MAX_KERNEL_SIZE 或 workgroup_size，需同步更新此值及 Rust 端编译时断言
 // 布局：(WG_Y + 2 * MAX_RADIUS) 行 × WG_X 列 = 18 × 8 = 144 个 f32
 // MAX_RADIUS = 5（对应最大 kernel_size = 11）
 // 行 0..r-1: 顶部 halo

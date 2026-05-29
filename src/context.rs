@@ -13,12 +13,18 @@ type PipelineCacheEntry = (String, Arc<ComputePipeline>);
 
 struct PipelineCache {
     entries: HashMap<PipelineCacheKey, PipelineCacheEntry>,
+    access_order: Vec<PipelineCacheKey>,
+    max_entries: usize,
 }
 
 impl PipelineCache {
+    const DEFAULT_MAX_ENTRIES: usize = 64;
+
     fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            access_order: Vec::new(),
+            max_entries: Self::DEFAULT_MAX_ENTRIES,
         }
     }
 
@@ -34,7 +40,9 @@ impl PipelineCache {
         if let Some((cached_source, pipeline)) = self.entries.get(&key) {
             if cached_source == &descriptor.wgsl {
                 log::debug!("管线缓存命中: hash={:016x}, wg={:?}", hash, descriptor.workgroup_size);
-                return Ok(Arc::clone(pipeline));
+                let cloned = Arc::clone(pipeline);
+                self.touch(&key);
+                return Ok(cloned);
             }
             log::warn!(
                 "fxhash 碰撞检测: hash={:016x} 命中但源码不匹配，重新编译管线",
@@ -47,14 +55,34 @@ impl PipelineCache {
             hash,
             descriptor.workgroup_size
         );
+        self.evict_if_needed();
         let pipeline = ComputePipeline::create(device, descriptor)?;
         let arc = Arc::new(pipeline);
-        self.entries.insert(key, (descriptor.wgsl.to_owned(), Arc::clone(&arc)));
+        self.entries.insert(key.clone(), (descriptor.wgsl.to_owned(), Arc::clone(&arc)));
+        self.access_order.push(key);
         Ok(arc)
+    }
+
+    fn touch(&mut self, key: &PipelineCacheKey) {
+        self.access_order.retain(|k| k != key);
+        self.access_order.push(key.clone());
+    }
+
+    fn evict_if_needed(&mut self) {
+        while self.entries.len() >= self.max_entries {
+            if let Some(old_key) = self.access_order.first().cloned() {
+                self.access_order.remove(0);
+                self.entries.remove(&old_key);
+                log::debug!("LRU 淘汰管线缓存条目");
+            } else {
+                break;
+            }
+        }
     }
 
     fn clear(&mut self) {
         self.entries.clear();
+        self.access_order.clear();
     }
 
     fn clear_bind_group_caches(&self) {
@@ -99,7 +127,7 @@ pub struct GpuContext {
     queue: Option<Queue>,
     limits: Limits,
     pipeline_cache: PipelineCache,
-    buffer_pool: BufferPool,
+    buffer_pool: Arc<BufferPool>,
     backend: ComputeBackend,
     compute_units: u32,
     push_constants_supported: bool,
@@ -231,7 +259,7 @@ impl GpuContext {
             queue: Some(queue),
             limits,
             pipeline_cache: PipelineCache::new(),
-            buffer_pool: BufferPool::new(),
+            buffer_pool: Arc::new(BufferPool::new()),
             backend: ComputeBackend::Gpu,
             compute_units,
             push_constants_supported: actual_push_constants,
@@ -285,7 +313,7 @@ impl GpuContext {
             queue: Some(queue),
             limits,
             pipeline_cache: PipelineCache::new(),
-            buffer_pool: BufferPool::new(),
+            buffer_pool: Arc::new(BufferPool::new()),
             backend: ComputeBackend::Cpu,
             compute_units,
             push_constants_supported: false,
@@ -306,7 +334,7 @@ impl GpuContext {
             queue: None,
             limits: Limits::default(),
             pipeline_cache: PipelineCache::new(),
-            buffer_pool: BufferPool::new(),
+            buffer_pool: Arc::new(BufferPool::new()),
             backend: ComputeBackend::Cpu,
             compute_units: 4,
             push_constants_supported: false,
@@ -371,6 +399,14 @@ impl GpuContext {
         &self.buffer_pool
     }
 
+    /// 返回共享缓冲区复用池的 Arc 引用。
+    ///
+    /// 用于需要长期持有 BufferPool 引用的场景（如 `GpuBatchSubmitter`），
+    /// 确保 BufferPool 在持有者存活期间不会被释放。
+    pub fn buffer_pool_arc(&self) -> Arc<BufferPool> {
+        Arc::clone(&self.buffer_pool)
+    }
+
     /// 从内部管线缓存获取或创建计算管线。
     ///
     /// 首次调用会编译着色器并缓存，后续调用直接返回缓存结果。
@@ -411,7 +447,7 @@ impl GpuContext {
     pub fn device(&self) -> Result<&Device, GpuError> {
         self.device
             .as_ref()
-            .ok_or_else(|| GpuError::CpuFallback("GPU device not available in CPU-only mode".to_string()))
+            .ok_or_else(|| GpuError::CpuFallback("CPU 降级模式下 GPU 设备不可用".to_string()))
     }
 
     /// 返回 GPU 队列引用。
@@ -421,6 +457,6 @@ impl GpuContext {
     pub fn queue(&self) -> Result<&Queue, GpuError> {
         self.queue
             .as_ref()
-            .ok_or_else(|| GpuError::CpuFallback("GPU queue not available in CPU-only mode".to_string()))
+            .ok_or_else(|| GpuError::CpuFallback("CPU 降级模式下 GPU 命令队列不可用".to_string()))
     }
 }

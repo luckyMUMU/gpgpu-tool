@@ -1,7 +1,7 @@
 use crate::buffer::{BufferUsage, GpuBuffer};
 use crate::context::GpuContext;
 use crate::error::GpuError;
-use crate::pipeline::{ComputePipeline, PipelineDescriptor};
+use crate::pipeline::{ComputePipeline, PipelineDescriptor, wgsl_push_constant_to_uniform};
 
 /// 感知哈希公共参数，通过 Push Constant 传递给 WGSL。
 ///
@@ -18,17 +18,6 @@ pub struct PhashParams {
 
 /// Push Constant 参数大小（字节数）。
 const PHASH_PUSH_CONSTANT_SIZE: u32 = std::mem::size_of::<PhashParams>() as u32;
-
-/// 将 Push Constant 版 WGSL 转换为 Uniform buffer 回退版 WGSL。
-///
-/// 替换 `var<push_constant> params: Params;` 为
-/// `@group(0) @binding(2) var<uniform> params: Params;`。
-fn wgsl_push_constant_to_uniform(wgsl: &str) -> String {
-    wgsl.replace(
-        "var<push_constant> params: Params;",
-        "@group(0) @binding(2) var<uniform> params: Params;",
-    )
-}
 
 /// 根据设备 Push Constant 支持情况创建感知哈希管线描述符。
 ///
@@ -152,6 +141,69 @@ pub trait PerceptualHashComputer {
     fn hash_size(&self) -> HashSize;
 }
 
+/// 将 GPU 输出的原始 u32 字节解析为 u64 哈希值列表。
+///
+/// 每个图像的哈希由 `u32s_per_image` 个 u32 组成，两两配对合并为 u64
+/// （低 32 位在前，高 32 位在后）。当 u32 数量为奇数时，最高位补零。
+fn parse_hash_results(raw: &[u8], image_count: usize, hash_size: HashSize) -> Vec<u64> {
+    let u32s_per_image = hash_size.u32s_per_image() as usize;
+    let u64s_per_image = u32s_per_image.div_ceil(2);
+    let raw_u32 = bytemuck::cast_slice::<u8, u32>(raw);
+    let mut hashes = Vec::with_capacity(image_count * u64s_per_image);
+    for i in 0..image_count {
+        let base = i * u32s_per_image;
+        for chunk in 0..u64s_per_image {
+            let lo_idx = base + chunk * 2;
+            let low = raw_u32[lo_idx] as u64;
+            let high = if lo_idx + 1 < base + u32s_per_image {
+                raw_u32[lo_idx + 1] as u64
+            } else {
+                0
+            };
+            hashes.push(low | (high << 32));
+        }
+    }
+    hashes
+}
+
+/// 执行感知哈希 dispatch 并下载解析结果。
+///
+/// 封装了参数编码 → dispatch_with_params → 下载 → u32→u64 解析的公共流程，
+/// 消除 `compute_phash` 和 `compute_phash_from_gpu_buffer` 之间的重复逻辑。
+#[allow(clippy::too_many_arguments)]
+fn dispatch_and_parse_hash(
+    pipeline: &ComputePipeline,
+    ctx: &GpuContext,
+    params: &PhashParams,
+    input_buffer: &GpuBuffer,
+    output_buffer: &GpuBuffer,
+    workgroup_size: [u32; 3],
+    image_count: usize,
+    hash_size: HashSize,
+) -> Result<Vec<u64>, GpuError> {
+    let device = ctx.device()?;
+    let queue = ctx.queue()?;
+
+    let params_arr = [*params];
+    let params_bytes = bytemuck::cast_slice::<PhashParams, u8>(&params_arr);
+
+    let dispatch_x = params.width.div_ceil(workgroup_size[0]).max(1);
+    let dispatch_y = params.height.div_ceil(workgroup_size[1]).max(1);
+    let dispatch_z = image_count as u32;
+
+    pipeline.dispatch_with_params(
+        device,
+        queue,
+        params_bytes,
+        &[input_buffer, output_buffer],
+        [dispatch_x, dispatch_y, dispatch_z],
+        ctx.compute_units(),
+    );
+
+    let result = output_buffer.download_with_pool(device, queue, ctx.buffer_pool())?;
+    Ok(parse_hash_results(&result, image_count, hash_size))
+}
+
 /// 通用感知哈希 GPU 计算流程。
 ///
 /// 封装了像素打包 → 缓冲区创建 → dispatch → 下载 → 解析的完整流水线，
@@ -170,7 +222,9 @@ pub fn compute_phash(
     workgroup_size: [u32; 3],
     hash_size: HashSize,
 ) -> Result<Vec<u64>, GpuError> {
-    if images.is_empty() { return Ok(vec![]); }
+    if images.is_empty() {
+        return Ok(vec![]);
+    }
 
     let device = ctx.device()?;
     let queue = ctx.queue()?;
@@ -178,7 +232,6 @@ pub fn compute_phash(
     let image_count = images.len();
     let pixels_per_image = images[0].len();
     let u32s_per_image = hash_size.u32s_per_image() as usize;
-    let u64s_per_image = u32s_per_image.div_ceil(2);
 
     for img in images {
         if img.len() != pixels_per_image {
@@ -197,7 +250,6 @@ pub fn compute_phash(
     let input_buffer_raw = buffer_pool.acquire(device, input_size, BufferUsage::Storage);
     let output_buffer_raw = buffer_pool.acquire(device, output_size, BufferUsage::Storage);
     queue.write_buffer(&input_buffer_raw, 0, bytemuck::cast_slice(&all_pixels));
-    queue.write_buffer(&output_buffer_raw, 0, &vec![0u8; output_size as usize]);
 
     let input_buffer = GpuBuffer::from_raw(input_buffer_raw, input_size);
     let output_buffer = GpuBuffer::from_raw(output_buffer_raw, output_size);
@@ -208,49 +260,15 @@ pub fn compute_phash(
         height,
         hash_size: hash_size.size(),
     };
-    let params_arr = [params];
-    let params_bytes = bytemuck::cast_slice::<PhashParams, u8>(&params_arr);
 
-    let dispatch_x = width.div_ceil(workgroup_size[0]).max(1);
-    let dispatch_y = height.div_ceil(workgroup_size[1]).max(1);
-    let dispatch_z = image_count as u32;
+    let hashes = dispatch_and_parse_hash(
+        pipeline, ctx, &params, &input_buffer, &output_buffer,
+        workgroup_size, image_count, hash_size,
+    )?;
 
-    if pipeline.push_constant_size().is_some() {
-        pipeline.dispatch(
-            device, queue,
-            &[&input_buffer, &output_buffer],
-            [dispatch_x, dispatch_y, dispatch_z],
-            Some(params_bytes),
-            ctx.compute_units(),
-        );
-    } else {
-        let params_buffer = GpuBuffer::from_data(device, &[params], BufferUsage::Uniform);
-        pipeline.dispatch(
-            device, queue,
-            &[&input_buffer, &output_buffer, &params_buffer],
-            [dispatch_x, dispatch_y, dispatch_z],
-            None,
-            ctx.compute_units(),
-        );
-    }
-
-    let result = output_buffer.download_with_pool(device, queue, buffer_pool)?;
     buffer_pool.release(input_buffer.into_raw(), BufferUsage::Storage);
     buffer_pool.release(output_buffer.into_raw(), BufferUsage::Storage);
 
-    let raw_u32 = bytemuck::cast_slice::<u8, u32>(&result);
-    let mut hashes = Vec::with_capacity(image_count * u64s_per_image);
-    for i in 0..image_count {
-        let base = i * u32s_per_image;
-        for chunk in 0..u64s_per_image {
-            let lo_idx = base + chunk * 2;
-            let low = raw_u32[lo_idx] as u64;
-            let high = if lo_idx + 1 < base + u32s_per_image {
-                raw_u32[lo_idx + 1] as u64
-            } else { 0 };
-            hashes.push(low | (high << 32));
-        }
-    }
     Ok(hashes)
 }
 
@@ -269,17 +287,16 @@ pub fn compute_phash_from_gpu_buffer(
     workgroup_size: [u32; 3],
     hash_size: HashSize,
 ) -> Result<Vec<u64>, GpuError> {
-    if image_count == 0 { return Ok(vec![]); }
+    if image_count == 0 {
+        return Ok(vec![]);
+    }
 
     let device = ctx.device()?;
-    let queue = ctx.queue()?;
     let buffer_pool = ctx.buffer_pool();
     let u32s_per_image = hash_size.u32s_per_image() as usize;
-    let u64s_per_image = u32s_per_image.div_ceil(2);
     let output_size = (image_count * u32s_per_image * 4) as u64;
 
     let output_buffer_raw = buffer_pool.acquire(device, output_size, BufferUsage::Storage);
-    queue.write_buffer(&output_buffer_raw, 0, &vec![0u8; output_size as usize]);
     let output_buffer = GpuBuffer::from_raw(output_buffer_raw, output_size);
 
     let params = PhashParams {
@@ -288,48 +305,14 @@ pub fn compute_phash_from_gpu_buffer(
         height,
         hash_size: hash_size.size(),
     };
-    let params_arr = [params];
-    let params_bytes = bytemuck::cast_slice::<PhashParams, u8>(&params_arr);
 
-    let dispatch_x = width.div_ceil(workgroup_size[0]).max(1);
-    let dispatch_y = height.div_ceil(workgroup_size[1]).max(1);
-    let dispatch_z = image_count as u32;
+    let hashes = dispatch_and_parse_hash(
+        pipeline, ctx, &params, input_buffer, &output_buffer,
+        workgroup_size, image_count, hash_size,
+    )?;
 
-    if pipeline.push_constant_size().is_some() {
-        pipeline.dispatch(
-            device, queue,
-            &[input_buffer, &output_buffer],
-            [dispatch_x, dispatch_y, dispatch_z],
-            Some(params_bytes),
-            ctx.compute_units(),
-        );
-    } else {
-        let params_buffer = GpuBuffer::from_data(device, &[params], BufferUsage::Uniform);
-        pipeline.dispatch(
-            device, queue,
-            &[input_buffer, &output_buffer, &params_buffer],
-            [dispatch_x, dispatch_y, dispatch_z],
-            None,
-            ctx.compute_units(),
-        );
-    }
-
-    let result = output_buffer.download_with_pool(device, queue, buffer_pool)?;
     buffer_pool.release(output_buffer.into_raw(), BufferUsage::Storage);
 
-    let raw_u32 = bytemuck::cast_slice::<u8, u32>(&result);
-    let mut hashes = Vec::with_capacity(image_count * u64s_per_image);
-    for i in 0..image_count {
-        let base = i * u32s_per_image;
-        for chunk in 0..u64s_per_image {
-            let lo_idx = base + chunk * 2;
-            let low = raw_u32[lo_idx] as u64;
-            let high = if lo_idx + 1 < base + u32s_per_image {
-                raw_u32[lo_idx + 1] as u64
-            } else { 0 };
-            hashes.push(low | (high << 32));
-        }
-    }
     Ok(hashes)
 }
 

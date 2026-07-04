@@ -164,6 +164,7 @@ mod buffer;
 mod buffer_pool;
 mod context;
 mod error;
+mod memory_manager;
 mod pipeline;
 mod pipeline_builder;
 pub mod pixel_pack;
@@ -230,6 +231,11 @@ pub use batch::BatchJob;
 
 /// 统一的 GPU 计算错误类型。
 pub use error::GpuError;
+
+/// 动态内存管理器，根据 GPU/CPU 资源动态调整批处理大小。
+///
+/// 支持 OOM 自动回退和成功后渐进扩展。
+pub use memory_manager::MemoryManager;
 
 /// GPU/CPU 后端降级调度 trait，根据 `ctx.backend()` 自动选择执行路径。
 pub use backend_dispatcher::BackendDispatcher;

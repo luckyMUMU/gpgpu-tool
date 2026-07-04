@@ -262,10 +262,20 @@ impl PerceptualHasher {
         images: &[Vec<u8>],
         dimensions: &[(u32, u32)],
     ) -> Result<Vec<u64>, GpuError> {
+        let max_binding = ctx.limits().max_storage_buffer_binding_size as u64;
         let mut all_hashes = Vec::with_capacity(images.len());
         for (i, image) in images.iter().enumerate() {
             let (w, h) = dimensions[i];
             let dims = [(w, h)];
+
+            // 单图尺寸预检查：u32 对齐后字节数 = pixels * 4
+            let per_image_bytes = (image.len() * 4) as u64;
+            if per_image_bytes > max_binding {
+                return Err(GpuError::InvalidInput(format!(
+                    "图像 {} 尺寸 {} 字节超过 max_storage_buffer_binding_size {} 字节",
+                    i, per_image_bytes, max_binding
+                )));
+            }
 
             // 阶段一：预处理
             let gpu_images = self.preprocess_gpu(ctx, std::slice::from_ref(image), &dims)?;
@@ -292,7 +302,7 @@ impl PerceptualHasher {
     /// 从 GPU buffer 下载像素数据并计算阈值（均值或中位数）。
     ///
     /// 用于 Mean/Median Hash 的零拷贝管线场景。
-    pub(super) fn compute_thresholds_from_gpu_buffer(
+    pub(crate) fn compute_thresholds_from_gpu_buffer(
         &self,
         ctx: &GpuContext,
         gpu_buffer: &GpuBuffer,

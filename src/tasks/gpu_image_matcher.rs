@@ -167,12 +167,26 @@ impl GpuImageMatcher {
     /// 仅计算图像哈希，不做匹配。
     ///
     /// 返回 `Vec<HashBytes>`，每个元素为一张图像的感知哈希。
+    ///
+    /// 入口处对单图尺寸进行预检查，避免进入复杂管线后才在 `compute_phash` 中报错。
+    /// 批量总大小的分批由 `compute_phash` 内部处理（Task 4 已实现）。
     pub fn compute_hashes(
         &self,
         ctx: &GpuContext,
         images: &[Vec<u8>],
         dims: &[(u32, u32)],
     ) -> Result<Vec<HashBytes>, GpuError> {
+        // 单图尺寸预检查：u32 对齐后字节数 = pixels * 4
+        let max_binding = ctx.limits().max_storage_buffer_binding_size as u64;
+        for (i, image) in images.iter().enumerate() {
+            let per_image_bytes = (image.len() * 4) as u64;
+            if per_image_bytes > max_binding {
+                return Err(GpuError::InvalidInput(format!(
+                    "图像 {} 尺寸 {} 字节超过 max_storage_buffer_binding_size {} 字节",
+                    i, per_image_bytes, max_binding
+                )));
+            }
+        }
         let hashes_u64 = self.hasher.compute(ctx, images, dims)?;
         Ok(u64s_to_hash_bytes(&hashes_u64, self.hash_size))
     }

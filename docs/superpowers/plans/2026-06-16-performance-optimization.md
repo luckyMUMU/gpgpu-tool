@@ -301,7 +301,7 @@ Expected: 编译通过
 Run: `cargo test`
 Expected: 所有现有测试通过
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add src/tasks/hash_common.rs

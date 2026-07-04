@@ -1,0 +1,24 @@
+- [x] packed_dst 溢出防护：target_width/target_height > 65535 时返回 InvalidInput
+- [x] Push Constant 大小验证：≤128 且 4 字节对齐，dispatch 时验证 data 长度匹配
+- [x] upload_image_to_gpu 输入验证：image.len() == width * height
+- [x] SHA-256 批量提交缓冲区加入 buffers_to_keep_alive，避免提前 Drop
+- [x] PipelineCache LRU 淘汰：最大 64 条目，淘汰最旧而非全量清空
+- [x] SHA-256 cached_single_block_params 增长上限：最大 16 条目
+- [x] ComputePipeline::dispatch_with_params 统一 Push Constant/Uniform 分支
+- [x] 通用 wgsl_push_constant_to_uniform 函数替代两处独立实现
+- [x] compute_phash / compute_phash_from_gpu_buffer 重复消除
+- [x] resize_batch_inner / resize_batch_gpu_inner 重复消除
+- [x] GpuBatchSubmitter 错误路径 staging buffer 归还池
+- [x] GpuBatchSubmitter::clear() 归还 staging buffer 到 BufferPool
+- [x] Sha256BatchSubmitter 改用 BufferPool acquire_staging
+- [x] Sha256Computer 改用 download_with_pool
+- [x] GpuBuffer::download() 零尺寸快速返回
+- [x] resize_batch_gpu_from_buffer 零尺寸验证
+- [x] width * height u32 溢出防护（改用 u64 中间计算）
+- [x] 移除不必要的输出缓冲区零初始化
+- [x] GpuBuffer 按用途区分对齐（Uniform 16B / Storage 256B）
+- [x] BindGroup 缓存 LRU 淘汰替代全量清空
+- [x] 错误消息统一中文
+- [x] LDS 大小与 Rust 常量同步断言
+- [x] cargo build + cargo clippy 通过
+- [x] cargo test --lib 通过（42 passed, 0 failed）

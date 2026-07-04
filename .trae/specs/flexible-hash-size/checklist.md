@@ -1,0 +1,22 @@
+- [x] HashSize 类型定义完整：bits() / u32s_per_image() / u64s_per_image() / target_size() / Default / From<u32> 均实现
+- [x] HashBits 枚举标记 #[deprecated] 且 From<HashBits> for HashSize 转换正确
+- [x] PhashParams 扩展为 8 字段（32字节），满足 WGSL uniform 16 字节对齐
+- [x] 6 个 WGSL 着色器 hash_u32s 扩容为 array<u32, 128>，从 params 动态读取 hash_size
+- [x] block_hash.wgsl 中 blocks_x/blocks_y 从 params 动态获取，即时计算 block_mean（移除大数组避免 DX12 寄存器溢出）
+- [x] PerceptualHashComputer trait 使用 HashSize，compute_sized 参数类型正确
+- [x] declare_phash_computer! 宏生成 hash_size 字段和 with_config 签名正确
+- [x] impl_phash_computer_simple! 宏从实际图像数据推导 width/height（支持任意尺寸正方形图像）
+- [x] impl_phash_computer_custom_dims! 宏使用 hash_size 推导 width/height
+- [x] compute_phash 验证逻辑使用实际图像大小（不再强制 width*height 匹配）
+- [x] compute_phash / compute_phash_from_gpu_buffer 增加 hash_size 参数
+- [x] HashAlgorithm::target_size_for(hash_size) 按算法类型动态推导正确
+- [x] PerceptualHasher 构造函数接受 HashSize，new() 默认 8
+- [x] PerceptualHasher::compute() 使用动态 target_size
+- [x] 6 个薄包装模块宏调用适配新签名（无需改动，宏已更新）
+- [x] lib.rs 导出 HashSize
+- [x] 新增 hash_size=16/32 功能测试用例（block_hash 16×16/32×32、mean/median 16×16、gradient 16×17、double_gradient 16×16、vert_gradient 17×16）
+- [x] CPU 参考实现新增 block_hash_with_size 支持可变 hash_size
+- [x] 所有测试适配新 API 且通过
+- [x] 所有基准适配新 API（未直接使用 HashBits，已兼容）
+- [x] cargo build 通过
+- [x] cargo clippy 无新警告（库代码零 warning，测试文件仅有已有风格 warning）

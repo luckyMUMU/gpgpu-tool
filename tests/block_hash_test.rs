@@ -21,7 +21,7 @@ fn test_block_hash_single_8x8() {
     let hasher = BlockHashComputer::new(&mut ctx).expect("创建失败");
 
     let image = test_data::gradient_image(64);
-    let gpu_hash = hasher.compute(&ctx, &[image.clone()]).expect("计算失败")[0];
+    let gpu_hash = hasher.compute(&ctx, std::slice::from_ref(&image)).expect("计算失败")[0];
     let cpu_hash = hash_reference::block_hash(&image, 8, 8);
 
     assert_eq!(gpu_hash, cpu_hash, "Block Hash 8x8 单图像测试失败");
@@ -39,7 +39,7 @@ fn test_block_hash_single_16x16() {
     let hasher = BlockHashComputer::with_config(&mut ctx, [8, 8, 1], HashSize::new(16)).expect("创建失败");
 
     let image = test_data::gradient_image(256);
-    let gpu_hashes = hasher.compute(&ctx, &[image.clone()]).expect("计算失败");
+    let gpu_hashes = hasher.compute(&ctx, std::slice::from_ref(&image)).expect("计算失败");
     let cpu_hashes = hash_reference::block_hash_with_size(&image, 16, 16, 16);
 
     assert_eq!(gpu_hashes, cpu_hashes, "Block Hash 16x16 单图像测试失败");
@@ -57,7 +57,7 @@ fn test_block_hash_single_32x32() {
     let hasher = BlockHashComputer::with_config(&mut ctx, [8, 8, 1], HashSize::new(32)).expect("创建失败");
 
     let image = test_data::gradient_image(1024);
-    let gpu_hashes = hasher.compute(&ctx, &[image.clone()]).expect("计算失败");
+    let gpu_hashes = hasher.compute(&ctx, std::slice::from_ref(&image)).expect("计算失败");
     let cpu_hashes = hash_reference::block_hash_with_size(&image, 32, 32, 32);
 
     assert_eq!(gpu_hashes, cpu_hashes, "Block Hash 32x32 单图像测试失败");
@@ -111,7 +111,7 @@ fn test_block_hash_img_hash_verify() {
 
     // 使用随机图像测试（8x8 = 64 像素）
     let image = test_data::random_image(64);
-    let gpu_hash = hasher.compute(&ctx, &[image.clone()]).expect("计算失败")[0];
+    let gpu_hash = hasher.compute(&ctx, std::slice::from_ref(&image)).expect("计算失败")[0];
 
     // GPU vs img_hash 交叉校验（仅对比水平比较部分）
     let img_hash_match = img_hash_verify::verify_block_hash_horizontal(&image, 8, 8, gpu_hash);

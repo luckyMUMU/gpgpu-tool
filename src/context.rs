@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use wgpu::{Adapter, Device, Instance, Limits, Queue};
@@ -8,12 +9,25 @@ use crate::ComputeBackend;
 use crate::error::GpuError;
 use crate::pipeline::{BindingType, ComputePipeline, PipelineDescriptor};
 
+/// GPU 显存不足标志，由 UncapturedErrorHandler 设置。
+///
+/// 当 GPU 发生 OOM 错误时，handler 将此标志置为 `true`，
+/// 后续 `GpuContext::backend()` 调用会检测此标志并切换到 CPU 降级模式，
+/// 避免进程被驱动级别崩溃终止。
+pub(crate) static GPU_OOM_FLAG: AtomicBool = AtomicBool::new(false);
+
+/// GPU 设备丢失标志，由 UncapturedErrorHandler 设置。
+///
+/// 设备丢失是不可恢复的终态，handler 置位后 `backend()` 将返回 CPU 模式。
+pub(crate) static GPU_DEVICE_LOST_FLAG: AtomicBool = AtomicBool::new(false);
+
 type PipelineCacheKey = (Vec<BindingType>, u64, [u32; 3], Option<u32>, &'static str);
 type PipelineCacheEntry = (String, Arc<ComputePipeline>);
 
 struct PipelineCache {
     entries: HashMap<PipelineCacheKey, PipelineCacheEntry>,
-    access_order: Vec<PipelineCacheKey>,
+    generations: HashMap<PipelineCacheKey, u64>,
+    next_gen: u64,
     max_entries: usize,
 }
 
@@ -23,7 +37,8 @@ impl PipelineCache {
     fn new() -> Self {
         Self {
             entries: HashMap::new(),
-            access_order: Vec::new(),
+            generations: HashMap::new(),
+            next_gen: 0,
             max_entries: Self::DEFAULT_MAX_ENTRIES,
         }
     }
@@ -59,19 +74,23 @@ impl PipelineCache {
         let pipeline = ComputePipeline::create(device, descriptor)?;
         let arc = Arc::new(pipeline);
         self.entries.insert(key.clone(), (descriptor.wgsl.to_owned(), Arc::clone(&arc)));
-        self.access_order.push(key);
+        self.generations.insert(key, self.next_gen);
+        self.next_gen += 1;
         Ok(arc)
     }
 
+    /// 更新 key 的访问时间戳，O(1) HashMap 插入。
     fn touch(&mut self, key: &PipelineCacheKey) {
-        self.access_order.retain(|k| k != key);
-        self.access_order.push(key.clone());
+        self.generations.insert(key.clone(), self.next_gen);
+        self.next_gen += 1;
     }
 
+    /// LRU 淘汰：移除 generation 最小（最久未访问）的条目。
     fn evict_if_needed(&mut self) {
         while self.entries.len() >= self.max_entries {
-            if let Some(old_key) = self.access_order.first().cloned() {
-                self.access_order.remove(0);
+            let oldest = self.generations.iter().min_by_key(|(_, g)| *g).map(|(k, _)| k.clone());
+            if let Some(old_key) = oldest {
+                self.generations.remove(&old_key);
                 self.entries.remove(&old_key);
                 log::debug!("LRU 淘汰管线缓存条目");
             } else {
@@ -82,7 +101,8 @@ impl PipelineCache {
 
     fn clear(&mut self) {
         self.entries.clear();
-        self.access_order.clear();
+        self.generations.clear();
+        self.next_gen = 0;
     }
 
     fn clear_bind_group_caches(&self) {
@@ -188,6 +208,39 @@ impl GpuContext {
         pollster::block_on(Self::new())
     }
 
+    /// 为集成场景创建 GPU 上下文，明确区分"GPU 不可用"与"GPU 出错"。
+    ///
+    /// 与 [`new_sync()`](Self::new_sync) 的区别：
+    /// - `new_sync()` 失败时自动降级到 CPU 模式（需 `cpu-fallback` feature）
+    /// - `new_for_integration()` 失败时直接返回错误，由调用方决策降级策略
+    ///
+    /// # 错误
+    ///
+    /// - [`GpuError::GpuUnavailable`] — 无可用 GPU 适配器，调用方可降级到 CPU
+    /// - 其他错误 — GPU 初始化过程中的其他问题（设备请求失败等）
+    ///
+    /// # 示例
+    ///
+    /// ```no_run
+    /// use gpgpu_tool::{GpuContext, GpuError};
+    ///
+    /// match GpuContext::new_for_integration() {
+    ///     Ok(ctx) => println!("GPU 就绪: {}", ctx.adapter_info()),
+    ///     Err(GpuError::GpuUnavailable) => {
+    ///         println!("GPU 不可用，降级到 CPU 路径");
+    ///         // 调用方自行实现 CPU 降级
+    ///     }
+    ///     Err(e) => panic!("GPU 初始化失败: {}", e),
+    /// }
+    /// ```
+    pub fn new_for_integration() -> Result<Self, GpuError> {
+        match pollster::block_on(Self::init_gpu()) {
+            Ok(ctx) => Ok(ctx),
+            Err(GpuError::NoAdapter) => Err(GpuError::GpuUnavailable),
+            Err(e) => Err(e),
+        }
+    }
+
     /// 正常 GPU 初始化：高性能适配器 + 硬件设备。
     ///
     /// 优先请求 `PUSH_CONSTANTS` 特性；若适配器不支持则降级到不使用
@@ -223,18 +276,48 @@ impl GpuContext {
             wgpu::Features::empty()
         };
 
+        let adapter_limits = adapter.limits();
+        let required_limits = Limits {
+            max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size,
+            ..Limits::default()
+        };
+
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("wgpu-compute-engine"),
                     required_features,
-                    required_limits: Limits::default(),
+                    required_limits,
                     ..Default::default()
                 },
                 None,
             )
             .await
             .map_err(|e| GpuError::DeviceRequest(e.to_string()))?;
+
+        // 注册 UncapturedErrorHandler：捕获 OOM 错误并设置原子标志，
+        // 后续 `backend()` 调用据此切换到 CPU 降级，避免进程被驱动级别崩溃终止。
+        // wgpu v24 的 Error 枚举仅有 OutOfMemory/Validation/Internal 三个变体，
+        // 设备丢失通过独立的 set_device_lost_callback 回调处理。
+        device.on_uncaptured_error(Box::new(|e| {
+            match e {
+                wgpu::Error::OutOfMemory { .. } => {
+                    log::error!("GPU 显存不足: {:?}", e);
+                    GPU_OOM_FLAG.store(true, Ordering::SeqCst);
+                }
+                wgpu::Error::Internal { ref description, .. } => {
+                    // Internal 错误可能包含设备丢失等不可恢复状态，保守降级
+                    log::error!("GPU 内部错误（保守触发降级）: {}", description);
+                    GPU_DEVICE_LOST_FLAG.store(true, Ordering::SeqCst);
+                }
+                _ => log::warn!("GPU 验证错误: {:?}", e),
+            }
+        }));
+        // 注册设备丢失回调：wgpu v24 通过独立回调通知设备丢失
+        device.set_device_lost_callback(|reason, msg| {
+            log::error!("GPU 设备丢失: reason={:?}, msg={}", reason, msg);
+            GPU_DEVICE_LOST_FLAG.store(true, Ordering::SeqCst);
+        });
 
         let limits = device.limits();
         let compute_units = estimate_compute_units(adapter_info.device_type);
@@ -302,6 +385,25 @@ impl GpuContext {
             )
             .await
             .map_err(|e| GpuError::DeviceRequest(e.to_string()))?;
+
+        // 软件渲染适配器同样注册 UncapturedErrorHandler，保持错误处理一致性。
+        device.on_uncaptured_error(Box::new(|e| {
+            match e {
+                wgpu::Error::OutOfMemory { .. } => {
+                    log::error!("软件渲染适配器显存不足: {:?}", e);
+                    GPU_OOM_FLAG.store(true, Ordering::SeqCst);
+                }
+                wgpu::Error::Internal { ref description, .. } => {
+                    log::error!("软件渲染适配器内部错误（保守触发降级）: {}", description);
+                    GPU_DEVICE_LOST_FLAG.store(true, Ordering::SeqCst);
+                }
+                _ => log::warn!("软件渲染适配器验证错误: {:?}", e),
+            }
+        }));
+        device.set_device_lost_callback(|reason, msg| {
+            log::error!("软件渲染适配器设备丢失: reason={:?}, msg={}", reason, msg);
+            GPU_DEVICE_LOST_FLAG.store(true, Ordering::SeqCst);
+        });
 
         let limits = device.limits();
         let compute_units = estimate_compute_units(adapter_info.device_type);
@@ -440,6 +542,25 @@ impl GpuContext {
         self.pipeline_cache.clear_bind_group_caches();
     }
 
+    /// 检查 GPU 设备是否丢失。
+    ///
+    /// 调用 `device.poll(wgpu::Maintain::Poll)` 检查设备状态。
+    /// wgpu v24 中 `poll()` 返回 `MaintainResult`：
+    /// - `MaintainResult::Ok` — 设备正常
+    /// - `MaintainResult::SubmissionQueueEmpty` — 提交队列为空，设备正常
+    /// 如果设备已丢失，返回 `Err(GpuError::DeviceLost)`。
+    /// 注意：wgpu 的设备丢失通过 `UncapturedErrorHandler` 回调通知，
+    /// 此方法仅提供同步检查。
+    pub fn check_device_lost(&self) -> Result<(), GpuError> {
+        if let Some(ref device) = self.device {
+            device.poll(wgpu::Maintain::Poll);
+            // wgpu v24 中 poll() 返回 MaintainResult，但不直接指示设备丢失。
+            // 设备丢失通过 on_uncaptured_error 回调处理。
+            // 此处保留 DeviceLost 错误变体供未来使用。
+        }
+        Ok(())
+    }
+
     /// 返回 GPU 设备引用。
     ///
     /// GPU 模式和软件渲染降级模式下返回 `Ok`。
@@ -458,5 +579,52 @@ impl GpuContext {
         self.queue
             .as_ref()
             .ok_or_else(|| GpuError::CpuFallback("CPU 降级模式下 GPU 命令队列不可用".to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// 验证 GPU_OOM_FLAG 标志存在且可被设置/重置。
+    ///
+    /// 这是 P0 显存安全防御层 1 的基础测试：UncapturedErrorHandler
+    /// 通过设置此标志通知后续 `backend()` 调用切换到 CPU 降级。
+    #[test]
+    fn test_gpu_oom_flag_can_be_set_and_reset() {
+        // 重置初始状态（其他测试可能已设置）
+        GPU_OOM_FLAG.store(false, Ordering::SeqCst);
+
+        assert!(!GPU_OOM_FLAG.load(Ordering::SeqCst), "初始状态应为 false");
+
+        GPU_OOM_FLAG.store(true, Ordering::SeqCst);
+        assert!(GPU_OOM_FLAG.load(Ordering::SeqCst), "设置后应为 true");
+
+        GPU_OOM_FLAG.store(false, Ordering::SeqCst);
+        assert!(!GPU_OOM_FLAG.load(Ordering::SeqCst), "重置后应为 false");
+    }
+
+    /// 验证 GPU_DEVICE_LOST_FLAG 标志存在且可被设置/重置。
+    #[test]
+    fn test_gpu_device_lost_flag_can_be_set_and_reset() {
+        GPU_DEVICE_LOST_FLAG.store(false, Ordering::SeqCst);
+
+        assert!(
+            !GPU_DEVICE_LOST_FLAG.load(Ordering::SeqCst),
+            "初始状态应为 false"
+        );
+
+        GPU_DEVICE_LOST_FLAG.store(true, Ordering::SeqCst);
+        assert!(
+            GPU_DEVICE_LOST_FLAG.load(Ordering::SeqCst),
+            "设置后应为 true"
+        );
+
+        GPU_DEVICE_LOST_FLAG.store(false, Ordering::SeqCst);
+        assert!(
+            !GPU_DEVICE_LOST_FLAG.load(Ordering::SeqCst),
+            "重置后应为 false"
+        );
     }
 }

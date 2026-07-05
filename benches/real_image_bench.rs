@@ -5,11 +5,6 @@ use std::time::{Duration, Instant};
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use image::GenericImageView;
 use gpgpu_tool::{
-    tasks::hash_common::PerceptualHashComputer,
-    tasks::mean_hash::MeanHashComputer,
-    tasks::median_hash::MedianHashComputer,
-    tasks::gradient_hash::GradientHashComputer,
-    tasks::block_hash::BlockHashComputer,
     tasks::phasher::{HashAlgorithm, PerceptualHasher},
     tasks::sha256::Sha256Computer,
     GpuContext,

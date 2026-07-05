@@ -13,16 +13,54 @@ use crate::tasks::bktree::{hamming_distance, BkTree};
 use crate::tasks::dihedral::DihedralHashes64;
 
 /// 匹配结果。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct MatchResult {
     pub hash: u64,
     pub distance: u32,
+    /// Hash quality score (0.0-1.0), if available. Used by PDQ hash.
+    pub quality: Option<f32>,
 }
+
+impl PartialEq for MatchResult {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash && self.distance == other.distance
+    }
+}
+
+impl Eq for MatchResult {}
 
 /// 匹配策略抽象接口（策略模式）。
 pub trait HashMatcher {
     /// 查找与 `query` 汉明距离 ≤ `threshold` 的所有哈希。
     fn find_similar(&self, query: u64, threshold: u32) -> Vec<MatchResult>;
+
+    /// 批量查询：一次查询多个 query，GPU 实现可并行计算。
+    ///
+    /// 默认实现逐个调用 `find_similar`，GPU 实现应覆盖此方法以获得并行加速。
+    fn find_similar_batch(&self, queries: &[u64], threshold: u32) -> Vec<Vec<MatchResult>> {
+        queries.iter().map(|&q| self.find_similar(q, threshold)).collect()
+    }
+
+    /// 使用归一化阈值比例查找相似哈希。
+    ///
+    /// `ratio` 取值范围 0.0-1.0，内部计算 `threshold = (ratio * 64.0) as u32`。
+    ///
+    /// # 推荐比例范围
+    ///
+    /// - 64-bit 哈希：`0.0`（精确匹配）到 `0.25`（最多 16 位差异）
+    /// - 推荐 `0.05`-`0.15` 用于相似图像检测
+    fn find_similar_ratio(&self, query: u64, ratio: f32) -> Vec<MatchResult> {
+        let threshold = (ratio * 64.0) as u32;
+        self.find_similar(query, threshold)
+    }
+
+    /// 使用归一化阈值比例批量查找相似哈希。
+    ///
+    /// 参见 [`find_similar_ratio`](HashMatcher::find_similar_ratio)。
+    fn find_similar_batch_ratio(&self, queries: &[u64], ratio: f32) -> Vec<Vec<MatchResult>> {
+        let threshold = (ratio * 64.0) as u32;
+        self.find_similar_batch(queries, threshold)
+    }
 }
 
 /// 责任链策略。
@@ -62,6 +100,7 @@ impl HashMatcher for LinearScanMatcher {
             .map(|&h| MatchResult {
                 hash: h,
                 distance: hamming_distance(query, h),
+                quality: None,
             })
             .filter(|r| r.distance <= threshold)
             .collect()
@@ -88,7 +127,7 @@ impl HashMatcher for BkTreeMatcher {
         self.tree
             .find(query, threshold)
             .into_iter()
-            .map(|(hash, distance)| MatchResult { hash, distance })
+            .map(|(hash, distance)| MatchResult { hash, distance, quality: None })
             .collect()
     }
 }
@@ -181,6 +220,32 @@ impl HashMatcherFacade {
         }
     }
 
+    /// 创建 GPU 加速门面。
+    ///
+    /// 使用 GPU 并行计算汉明距离，适合大规模数据库匹配。
+    pub fn gpu(ctx: &mut crate::context::GpuContext, hashes: Vec<u64>) -> Result<Self, crate::error::GpuError> {
+        let gpu_matcher = crate::tasks::gpu_matcher::GpuHashMatcherFacade::new(ctx, hashes)?;
+        Ok(Self {
+            matcher: Box::new(gpu_matcher),
+            dihedral_enabled: false,
+        })
+    }
+
+    /// 创建 GPU 加速门面，使用共享的 GpuContext。
+    ///
+    /// 这是推荐的构造方式，允许多个 matcher 共享同一个 GPU 上下文，
+    /// 并支持真正的 GPU 批量匹配。
+    pub fn gpu_with_shared_ctx(
+        ctx: std::sync::Arc<std::sync::Mutex<crate::context::GpuContext>>,
+        hashes: Vec<u64>,
+    ) -> Result<Self, crate::error::GpuError> {
+        let gpu_matcher = crate::tasks::gpu_matcher::GpuHashMatcherFacade::new_with_shared_ctx(ctx, hashes)?;
+        Ok(Self {
+            matcher: Box::new(gpu_matcher),
+            dihedral_enabled: false,
+        })
+    }
+
     /// 启用二面体变换匹配。
     pub fn with_dihedral(mut self) -> Self {
         self.dihedral_enabled = true;
@@ -194,6 +259,38 @@ impl HashMatcherFacade {
         } else {
             self.matcher.find_similar(query, threshold)
         }
+    }
+
+    /// 批量查询：一次查询多个 query。
+    ///
+    /// GPU 实现会并行计算所有 query 的距离，CPU 实现逐个调用 `find_similar`。
+    pub fn find_similar_batch(&self, queries: &[u64], threshold: u32) -> Vec<Vec<MatchResult>> {
+        if self.dihedral_enabled {
+            queries.iter().map(|&q| self.find_similar_dihedral(q, threshold)).collect()
+        } else {
+            self.matcher.find_similar_batch(queries, threshold)
+        }
+    }
+
+    /// 使用归一化阈值比例查找相似哈希。
+    ///
+    /// `ratio` 取值范围 0.0-1.0，内部计算 `threshold = (ratio * 64.0) as u32`。
+    ///
+    /// # 推荐比例范围
+    ///
+    /// - 64-bit 哈希：`0.0`（精确匹配）到 `0.25`（最多 16 位差异）
+    /// - 推荐 `0.05`-`0.15` 用于相似图像检测
+    pub fn find_similar_ratio(&self, query: u64, ratio: f32) -> Vec<MatchResult> {
+        let threshold = (ratio * 64.0) as u32;
+        self.find_similar(query, threshold)
+    }
+
+    /// 使用归一化阈值比例批量查找相似哈希。
+    ///
+    /// 参见 [`find_similar_ratio`](HashMatcherFacade::find_similar_ratio)。
+    pub fn find_similar_batch_ratio(&self, queries: &[u64], ratio: f32) -> Vec<Vec<MatchResult>> {
+        let threshold = (ratio * 64.0) as u32;
+        self.find_similar_batch(queries, threshold)
     }
 
     /// 二面体变换匹配：对查询哈希的 8 种变体分别匹配，返回去重后的结果。
@@ -310,11 +407,18 @@ mod tests {
 
     #[test]
     fn test_match_result_equality() {
-        let a = MatchResult { hash: 42, distance: 1 };
-        let b = MatchResult { hash: 42, distance: 1 };
-        let c = MatchResult { hash: 42, distance: 2 };
+        let a = MatchResult { hash: 42, distance: 1, quality: None };
+        let b = MatchResult { hash: 42, distance: 1, quality: None };
+        let c = MatchResult { hash: 42, distance: 2, quality: None };
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_match_result_equality_ignores_quality() {
+        let a = MatchResult { hash: 42, distance: 1, quality: None };
+        let b = MatchResult { hash: 42, distance: 1, quality: Some(0.5) };
+        assert_eq!(a, b, "quality should be ignored in PartialEq");
     }
 
     #[test]

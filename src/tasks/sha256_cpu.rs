@@ -16,17 +16,35 @@ impl Sha256Cpu {
 
     /// 计算多条消息的 SHA-256 哈希。
     pub fn compute(&self, messages: &[Vec<u8>]) -> Result<Vec<[u8; 32]>, GpuError> {
-        messages
-            .iter()
-            .map(|msg| {
-                let mut hasher = Sha256::new();
-                hasher.update(msg);
-                let result = hasher.finalize();
-                let mut hash = [0u8; 32];
-                hash.copy_from_slice(&result);
-                Ok(hash)
-            })
-            .collect()
+        #[cfg(feature = "parallel-cpu")]
+        {
+            use rayon::prelude::*;
+            messages
+                .par_iter()
+                .map(|msg| {
+                    let mut hasher = Sha256::new();
+                    hasher.update(msg);
+                    let result = hasher.finalize();
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(&result);
+                    Ok(hash)
+                })
+                .collect()
+        }
+        #[cfg(not(feature = "parallel-cpu"))]
+        {
+            messages
+                .iter()
+                .map(|msg| {
+                    let mut hasher = Sha256::new();
+                    hasher.update(msg);
+                    let result = hasher.finalize();
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(&result);
+                    Ok(hash)
+                })
+                .collect()
+        }
     }
 }
 

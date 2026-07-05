@@ -132,7 +132,14 @@ fn bench_gpu_overhead_breakdown(c: &mut Criterion) {
             @compute @workgroup_size(1)
             fn main() {}
         "#;
-        let pipeline = ComputePipeline::create(ctx.device().unwrap(), wgsl, [1, 1, 1]).unwrap();
+        let descriptor = gpgpu_tool::PipelineDescriptor {
+            bindings: vec![],
+            wgsl: wgsl.to_string(),
+            workgroup_size: [1, 1, 1],
+            entry_point: "main",
+            push_constant_size: None,
+        };
+        let pipeline = ComputePipeline::create(ctx.device().unwrap(), &descriptor).unwrap();
         let input = GpuBuffer::from_data(ctx.device().unwrap(), &[0u32; 16], BufferUsage::Storage);
         let output = GpuBuffer::empty(ctx.device().unwrap(), 64, BufferUsage::Storage);
         let params = GpuBuffer::from_data(ctx.device().unwrap(), &[0u32; 4], BufferUsage::Uniform);

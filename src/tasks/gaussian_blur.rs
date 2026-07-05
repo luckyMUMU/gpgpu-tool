@@ -1,3 +1,4 @@
+use crate::batch::GpuBatchSubmitter;
 use crate::buffer::GpuBuffer;
 use crate::context::GpuContext;
 use crate::error::GpuError;
@@ -15,6 +16,16 @@ impl GpuGaussianBlur {
     pub fn new(ctx: &mut GpuContext) -> Result<Self, GpuError> {
         let convolution = GpuConvolution::new(ctx)?;
         Ok(Self { convolution })
+    }
+
+    /// 返回内部卷积器的引用（用于融合管线编码）。
+    pub fn convolution(&self) -> &GpuConvolution {
+        &self.convolution
+    }
+
+    /// 生成 1D 高斯核（公开接口）。
+    pub fn generate_kernel(kernel_size: u32, sigma: f32) -> Result<Vec<f32>, GpuError> {
+        generate_gaussian_kernel_1d(kernel_size, sigma)
     }
 
     /// 对灰度图像执行高斯模糊。
@@ -58,6 +69,36 @@ impl GpuGaussianBlur {
         let kernel_1d = generate_gaussian_kernel_1d(kernel_size, sigma)?;
         self.convolution.convolve_separable_gpu(
             ctx,
+            input_buffer,
+            input_u32_count,
+            width,
+            height,
+            &kernel_1d,
+            kernel_size,
+            BorderMode::Clamp,
+        )
+    }
+
+    /// 对 GPU buffer 中的图像执行高斯模糊（批量编码模式），返回 GPU buffer。
+    ///
+    /// 与 `blur_gpu()` 功能相同，但将 dispatch 命令编码到
+    /// `GpuBatchSubmitter` 的共享 CommandEncoder 中，而非独立提交。
+    #[allow(clippy::too_many_arguments)]
+    pub fn blur_gpu_batch(
+        &self,
+        ctx: &GpuContext,
+        batch: &mut GpuBatchSubmitter,
+        input_buffer: &GpuBuffer,
+        input_u32_count: usize,
+        width: u32,
+        height: u32,
+        kernel_size: u32,
+        sigma: f32,
+    ) -> Result<GpuBuffer, GpuError> {
+        let kernel_1d = generate_gaussian_kernel_1d(kernel_size, sigma)?;
+        self.convolution.convolve_separable_gpu_batch(
+            ctx,
+            batch,
             input_buffer,
             input_u32_count,
             width,

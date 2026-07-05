@@ -28,7 +28,7 @@ fn test_mean_hash_single_8x8() {
     let hasher = MeanHashComputer::new(&mut ctx).expect("创建失败");
 
     let image = test_data::gradient_image(64);
-    let gpu_hash = hasher.compute(&ctx, &[image.clone()]).expect("计算失败")[0];
+    let gpu_hash = hasher.compute(&ctx, std::slice::from_ref(&image)).expect("计算失败")[0];
     let cpu_hash = hash_reference::mean_hash(&image, 8, 8);
 
     assert_eq!(gpu_hash, cpu_hash, "Mean Hash 8x8 单图像测试失败");
@@ -46,7 +46,7 @@ fn test_mean_hash_single_16x16() {
     let hasher = MeanHashComputer::with_config(&mut ctx, [8, 8, 1], HashSize::new(16)).expect("创建失败");
 
     let image = test_data::gradient_image(256);
-    let gpu_hashes = hasher.compute(&ctx, &[image.clone()]).expect("计算失败");
+    let gpu_hashes = hasher.compute(&ctx, std::slice::from_ref(&image)).expect("计算失败");
     let cpu_hashes = hash_reference::mean_hash_with_size(&image, 16, 16, 16);
 
     assert_eq!(gpu_hashes, cpu_hashes, "Mean Hash 16x16 单图像测试失败");
@@ -108,7 +108,7 @@ fn test_mean_hash_full_report() {
         let hash_size = HashSize::new(*w);
         let hasher = MeanHashComputer::with_config(&mut ctx, [8, 8, 1], hash_size).expect("创建失败");
         let image = test_data::gradient_image((w * h) as usize);
-        let gpu_hashes = hasher.compute(&ctx, &[image.clone()]).expect("计算失败");
+        let gpu_hashes = hasher.compute(&ctx, std::slice::from_ref(&image)).expect("计算失败");
         let cpu_hashes = hash_reference::mean_hash_with_size(&image, *w, *h, *w);
         report.add_test_result("Mean", &size, "single", gpu_hashes == cpu_hashes);
     }
@@ -160,7 +160,7 @@ fn test_mean_hash_img_hash_verify() {
 
     // 使用随机图像测试
     let image = test_data::random_image(64);
-    let gpu_hash = hasher.compute(&ctx, &[image.clone()]).expect("计算失败")[0];
+    let gpu_hash = hasher.compute(&ctx, std::slice::from_ref(&image)).expect("计算失败")[0];
 
     // GPU vs img_hash 交叉校验
     let img_hash_match = img_hash_verify::verify_mean_hash(&image, 8, 8, gpu_hash);

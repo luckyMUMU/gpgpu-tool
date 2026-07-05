@@ -21,7 +21,7 @@ fn test_double_gradient_hash_single_9x9() {
     let hasher = DoubleGradientHashComputer::new(&mut ctx).expect("创建失败");
 
     let image = test_data::gradient_image(81);
-    let gpu_hash = hasher.compute(&ctx, &[image.clone()]).expect("计算失败")[0];
+    let gpu_hash = hasher.compute(&ctx, std::slice::from_ref(&image)).expect("计算失败")[0];
     let cpu_hash = hash_reference::double_gradient_hash(&image, 9, 9);
 
     assert_eq!(gpu_hash, cpu_hash, "Double Gradient Hash 9x9 单图像测试失败");
@@ -39,7 +39,7 @@ fn test_double_gradient_hash_single_16x16() {
     let hasher = DoubleGradientHashComputer::with_config(&mut ctx, [8, 8, 1], HashSize::new(16)).expect("创建失败");
 
     let image = test_data::gradient_image(256);
-    let gpu_hashes = hasher.compute(&ctx, &[image.clone()]).expect("计算失败");
+    let gpu_hashes = hasher.compute(&ctx, std::slice::from_ref(&image)).expect("计算失败");
     let cpu_hashes = hash_reference::double_gradient_hash_with_size(&image, 16, 16, 16);
 
     assert_eq!(gpu_hashes, cpu_hashes, "Double Gradient Hash 16x16 单图像测试失败");
@@ -93,7 +93,7 @@ fn test_double_gradient_hash_img_hash_verify() {
 
     // 使用随机图像测试（9x9 = 81 像素）
     let image = test_data::random_image(81);
-    let gpu_hash = hasher.compute(&ctx, &[image.clone()]).expect("计算失败")[0];
+    let gpu_hash = hasher.compute(&ctx, std::slice::from_ref(&image)).expect("计算失败")[0];
 
     // GPU vs img_hash 交叉校验
     let img_hash_match = img_hash_verify::verify_double_gradient_hash(&image, 9, 9, gpu_hash);

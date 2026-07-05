@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::batch::GpuBatchSubmitter;
 use crate::buffer::{BufferUsage, GpuBuffer};
 use crate::context::GpuContext;
 use crate::error::GpuError;
@@ -161,10 +162,10 @@ impl GpuConvolution {
 
         let input_buffer_raw = ctx
             .buffer_pool()
-            .acquire(device, input_size, BufferUsage::Storage);
+            .acquire(device, input_size, BufferUsage::Storage)?;
         let output_buffer_raw = ctx
             .buffer_pool()
-            .acquire(device, output_size, BufferUsage::Storage);
+            .acquire(device, output_size, BufferUsage::Storage)?;
 
         queue.write_buffer(&input_buffer_raw, 0, bytemuck::cast_slice(&packed));
 
@@ -251,6 +252,40 @@ impl GpuConvolution {
         }
     }
 
+    /// 执行可分离卷积（批量编码模式），返回 GPU buffer。
+    ///
+    /// 与 `convolve_separable_gpu()` 功能相同，但将 dispatch 命令编码到
+    /// `GpuBatchSubmitter` 的共享 CommandEncoder 中，而非独立提交。
+    /// 适用于多个 GPU 操作可合并为单次 submit 的流水线场景。
+    #[allow(clippy::too_many_arguments)]
+    pub fn convolve_separable_gpu_batch(
+        &self,
+        ctx: &GpuContext,
+        batch: &mut GpuBatchSubmitter,
+        input_buffer: &GpuBuffer,
+        input_u32_count: usize,
+        width: u32,
+        height: u32,
+        kernel_1d: &[f32],
+        kernel_size: u32,
+        border_mode: BorderMode,
+    ) -> Result<GpuBuffer, GpuError> {
+        validate_1d_kernel(kernel_1d, kernel_size)?;
+
+        let pixel_count = (width as u64 * height as u64) as usize;
+        if input_u32_count != pixel_count {
+            return Err(GpuError::InvalidInput(
+                "输入 u32 数量与声明尺寸不符".to_string(),
+            ));
+        }
+
+        if self.use_lds {
+            self.convolve_separable_gpu_lds_batch(ctx, batch, input_buffer, width, height, kernel_1d, kernel_size, border_mode)
+        } else {
+            self.convolve_separable_gpu_global_batch(ctx, batch, input_buffer, width, height, kernel_1d, kernel_size, border_mode)
+        }
+    }
+
     /// LDS 优化的可分离卷积：融合水平 + 垂直 pass 为单次 dispatch。
     ///
     /// 水平结果存入 LDS 共享内存，垂直 pass 从 LDS 读取，
@@ -277,10 +312,10 @@ impl GpuConvolution {
 
         let input_buffer_raw = ctx
             .buffer_pool()
-            .acquire(device, input_size, BufferUsage::Storage);
+            .acquire(device, input_size, BufferUsage::Storage)?;
         let output_buffer_raw = ctx
             .buffer_pool()
-            .acquire(device, output_size, BufferUsage::Storage);
+            .acquire(device, output_size, BufferUsage::Storage)?;
 
         queue.write_buffer(&input_buffer_raw, 0, bytemuck::cast_slice(&packed));
 
@@ -331,7 +366,7 @@ impl GpuConvolution {
 
         let output_buffer_raw = ctx
             .buffer_pool()
-            .acquire(device, buffer_size, BufferUsage::Storage);
+            .acquire(device, buffer_size, BufferUsage::Storage)?;
         let output_buffer = GpuBuffer::from_raw(output_buffer_raw, buffer_size);
 
         let params = build_params(width, height, kernel_size, border_mode, PASS_MODE_FUSED_SEPARABLE, kernel_1d)?;
@@ -373,13 +408,13 @@ impl GpuConvolution {
 
         let input_buffer_raw = ctx
             .buffer_pool()
-            .acquire(device, buffer_size, BufferUsage::Storage);
+            .acquire(device, buffer_size, BufferUsage::Storage)?;
         let intermediate_buffer_raw = ctx
             .buffer_pool()
-            .acquire(device, buffer_size, BufferUsage::Storage);
+            .acquire(device, buffer_size, BufferUsage::Storage)?;
         let output_buffer_raw = ctx
             .buffer_pool()
-            .acquire(device, buffer_size, BufferUsage::Storage);
+            .acquire(device, buffer_size, BufferUsage::Storage)?;
 
         queue.write_buffer(&input_buffer_raw, 0, bytemuck::cast_slice(&packed));
 
@@ -451,10 +486,10 @@ impl GpuConvolution {
 
         let intermediate_buffer_raw = ctx
             .buffer_pool()
-            .acquire(device, buffer_size, BufferUsage::Storage);
+            .acquire(device, buffer_size, BufferUsage::Storage)?;
         let output_buffer_raw = ctx
             .buffer_pool()
-            .acquire(device, buffer_size, BufferUsage::Storage);
+            .acquire(device, buffer_size, BufferUsage::Storage)?;
 
         let intermediate_buffer = GpuBuffer::from_raw(intermediate_buffer_raw, buffer_size);
         let output_buffer = GpuBuffer::from_raw(output_buffer_raw, buffer_size);
@@ -492,6 +527,103 @@ impl GpuConvolution {
 
         ctx.buffer_pool()
             .release(intermediate_buffer.into_raw(), BufferUsage::Storage);
+
+        Ok(output_buffer)
+    }
+
+    /// LDS 优化的可分离卷积（批量编码模式）：将 dispatch 编码到共享 encoder。
+    #[allow(clippy::too_many_arguments)]
+    fn convolve_separable_gpu_lds_batch(
+        &self,
+        ctx: &GpuContext,
+        batch: &mut GpuBatchSubmitter,
+        input_buffer: &GpuBuffer,
+        width: u32,
+        height: u32,
+        kernel_1d: &[f32],
+        kernel_size: u32,
+        border_mode: BorderMode,
+    ) -> Result<GpuBuffer, GpuError> {
+        let device = ctx.device()?;
+        let pixel_count = (width as u64 * height as u64) as usize;
+        let buffer_size = (pixel_count * 4) as u64;
+
+        let output_buffer_raw = ctx
+            .buffer_pool()
+            .acquire(device, buffer_size, BufferUsage::Storage)?;
+        let output_buffer = GpuBuffer::from_raw(output_buffer_raw, buffer_size);
+
+        let params = build_params(width, height, kernel_size, border_mode, PASS_MODE_FUSED_SEPARABLE, kernel_1d)?;
+        let params_buffer = GpuBuffer::from_data(device, &[params], BufferUsage::Storage);
+
+        let dispatch_x = width.div_ceil(self.workgroup_size[0]).max(1);
+        let dispatch_y = height.div_ceil(self.workgroup_size[1]).max(1);
+        batch.encode_dispatch(
+            ctx,
+            &self.fused_pipeline,
+            &[input_buffer, &output_buffer, &params_buffer],
+            [dispatch_x, dispatch_y, 1],
+            None,
+            ctx.compute_units(),
+        )?;
+
+        Ok(output_buffer)
+    }
+
+    /// 全局内存路径的可分离卷积（批量编码模式）：将两趟 dispatch 编码到共享 encoder。
+    #[allow(clippy::too_many_arguments)]
+    fn convolve_separable_gpu_global_batch(
+        &self,
+        ctx: &GpuContext,
+        batch: &mut GpuBatchSubmitter,
+        input_buffer: &GpuBuffer,
+        width: u32,
+        height: u32,
+        kernel_1d: &[f32],
+        kernel_size: u32,
+        border_mode: BorderMode,
+    ) -> Result<GpuBuffer, GpuError> {
+        let pixel_count = (width as u64 * height as u64) as usize;
+        let buffer_size = (pixel_count * 4) as u64;
+
+        let device = ctx.device()?;
+
+        let intermediate_buffer_raw = ctx
+            .buffer_pool()
+            .acquire(device, buffer_size, BufferUsage::Storage)?;
+        let output_buffer_raw = ctx
+            .buffer_pool()
+            .acquire(device, buffer_size, BufferUsage::Storage)?;
+
+        let intermediate_buffer = GpuBuffer::from_raw(intermediate_buffer_raw, buffer_size);
+        let output_buffer = GpuBuffer::from_raw(output_buffer_raw, buffer_size);
+
+        let dispatch_x = width.div_ceil(self.workgroup_size[0]).max(1);
+        let dispatch_y = height.div_ceil(self.workgroup_size[1]).max(1);
+
+        // 水平 pass
+        let params_h = build_params(width, height, kernel_size, border_mode, 1, kernel_1d)?;
+        let params_buffer_h = GpuBuffer::from_data(device, &[params_h], BufferUsage::Storage);
+        batch.encode_dispatch(
+            ctx,
+            &self.pipeline,
+            &[input_buffer, &intermediate_buffer, &params_buffer_h],
+            [dispatch_x, dispatch_y, 1],
+            None,
+            ctx.compute_units(),
+        )?;
+
+        // 垂直 pass
+        let params_v = build_params(width, height, kernel_size, border_mode, 2, kernel_1d)?;
+        let params_buffer_v = GpuBuffer::from_data(device, &[params_v], BufferUsage::Storage);
+        batch.encode_dispatch(
+            ctx,
+            &self.pipeline,
+            &[&intermediate_buffer, &output_buffer, &params_buffer_v],
+            [dispatch_x, dispatch_y, 1],
+            None,
+            ctx.compute_units(),
+        )?;
 
         Ok(output_buffer)
     }

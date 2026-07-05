@@ -46,7 +46,7 @@ fn test_sha256_cpu_batch() {
 fn test_sha256_cpu_long_message() {
     let cpu = Sha256Cpu::new();
     let message = vec![0xAAu8; 1024];
-    let results = cpu.compute(&[message.clone()]).unwrap();
+    let results = cpu.compute(std::slice::from_ref(&message)).unwrap();
 
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();

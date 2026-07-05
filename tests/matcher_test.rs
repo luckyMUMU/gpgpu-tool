@@ -181,14 +181,17 @@ fn test_match_result_equality() {
     let a = MatchResult {
         hash: 42,
         distance: 1,
+        quality: None,
     };
     let b = MatchResult {
         hash: 42,
         distance: 1,
+        quality: None,
     };
     let c = MatchResult {
         hash: 42,
         distance: 2,
+        quality: None,
     };
     assert_eq!(a, b);
     assert_ne!(a, c);

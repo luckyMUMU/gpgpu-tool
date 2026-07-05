@@ -70,7 +70,7 @@ fn test_sha256_56_bytes() {
     let sha256 = Sha256Computer::new(&mut ctx).expect("Sha256Computer 创建失败");
 
     let message = vec![0xAAu8; 56];
-    let result = sha256.compute(&ctx, &[message.clone()]).expect("计算失败");
+    let result = sha256.compute(&ctx, std::slice::from_ref(&message)).expect("计算失败");
 
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -85,7 +85,7 @@ fn test_sha256_64_bytes() {
     let sha256 = Sha256Computer::new(&mut ctx).expect("Sha256Computer 创建失败");
 
     let message = vec![0xBBu8; 64];
-    let result = sha256.compute(&ctx, &[message.clone()]).expect("计算失败");
+    let result = sha256.compute(&ctx, std::slice::from_ref(&message)).expect("计算失败");
 
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -100,7 +100,7 @@ fn test_sha256_1kb() {
     let sha256 = Sha256Computer::new(&mut ctx).expect("Sha256Computer 创建失败");
 
     let message = vec![0xCCu8; 1024];
-    let result = sha256.compute(&ctx, &[message.clone()]).expect("计算失败");
+    let result = sha256.compute(&ctx, std::slice::from_ref(&message)).expect("计算失败");
 
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();

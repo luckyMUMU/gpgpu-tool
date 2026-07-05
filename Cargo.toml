@@ -1,13 +1,13 @@
 [package]
 name = "gpgpu-tool"
-version = "0.2.0"
-description = "GPGPU 加速算法库，基于 wgpu。优先使用 GPU 加速，支持 CPU 降级。提供 SHA-256、感知哈希、BK-tree 相似度搜索等开箱即用的 GPU 计算能力。"
+version = "0.3.0"
+description = "GPU 加速算法库，基于 wgpu。GPU 优先，CPU 降级。提供感知哈希（6种算法）、SHA-256、PDQ 哈希、GPU 汉明距离匹配、BK-tree 近似搜索等开箱即用的 GPU 计算能力。"
 edition = "2021"
 license = "GPL-3.0"
 readme = "README.md"
 repository = "https://github.com/solo-king/wgpu-tool"
-keywords = ["gpu", "compute", "wgpu", "parallel", "hashing"]
-categories = ["science::gpu", "algorithms::data-processing"]
+keywords = ["gpu", "compute", "wgpu", "parallel", "hashing", "perceptual-hash", "image-similarity"]
+categories = ["science::gpu", "algorithms::data-processing", "multimedia::images"]
 
 [dependencies]
 wgpu = "24"
@@ -15,15 +15,28 @@ pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 thiserror = "2"
 log = "0.4"
+smallvec = "1"
 image = { version = "0.25", optional = true }
 
 sha2 = { version = "0.10", optional = true }
+rayon = { version = "1.10", optional = true }
+wide = { version = "0.7", optional = true }
 
 [features]
-default = ["cpu-fallback"]
+default = []
 cpu-fallback = ["dep:sha2"]
+parallel-cpu = ["cpu-fallback", "dep:rayon"]
+dual-encoder = []
 pdq = []
 image = ["dep:image"]
+simd = ["dep:wide"]
+
+# GPU 加速集成入口 feature，聚合图像处理依赖。
+# wgpu 为核心依赖（始终包含），此 feature 额外启用 image crate 集成。
+gpu-accel = ["image"]
+
+# czkawka 兼容层入口，依赖 gpu-accel 和 parallel-cpu（rayon 并行解码）。
+czkawka-compat = ["gpu-accel", "parallel-cpu"]
 
 [dev-dependencies]
 rand = "0.9"
@@ -33,6 +46,13 @@ hex = "0.4"
 chrono = "0.4"
 image = "0.25"
 img_hash = "3.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[example]]
+name = "similar_images"
+path = "examples/similar_images.rs"
+required-features = ["czkawka-compat"]
 
 [package.metadata.docs.rs]
 features = ["image"]
@@ -100,4 +120,9 @@ harness = false
 [[bench]]
 name = "phash_bench"
 path = "benches/phash_bench.rs"
+harness = false
+
+[[bench]]
+name = "poll_count_bench"
+path = "benches/poll_count_bench.rs"
 harness = false

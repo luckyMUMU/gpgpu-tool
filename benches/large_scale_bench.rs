@@ -46,7 +46,7 @@ fn bench_phash_gpu_vs_cpu_resize(c: &mut Criterion) {
     if real_images.is_empty() { return; }
 
     let real_count = real_images.len();
-    let copies = (5000 + real_count - 1) / real_count;
+    let copies = 5000_usize.div_ceil(real_count);
     let total = real_count * copies;
 
     println!("\n=== GPU vs CPU 缩放: {} 张真实大图 ({} 张 × {} copies) ===", total, real_count, copies);

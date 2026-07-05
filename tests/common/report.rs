@@ -96,9 +96,9 @@ impl TestReport {
                 if size_results.is_empty() {
                     continue;
                 }
-                let single: Option<&TestResult> = size_results.iter().find(|r| r.test_type == "single").map(|r| *r);
-                let batch: Option<&TestResult> = size_results.iter().find(|r| r.test_type == "batch").map(|r| *r);
-                let empty: Option<&TestResult> = size_results.iter().find(|r| r.test_type == "empty").map(|r| *r);
+                let single: Option<&TestResult> = size_results.iter().find(|r| r.test_type == "single").copied();
+                let batch: Option<&TestResult> = size_results.iter().find(|r| r.test_type == "batch").copied();
+                let empty: Option<&TestResult> = size_results.iter().find(|r| r.test_type == "empty").copied();
 
                 md.push_str(&format!(
                     "| {} | {} | {} | {} | {} |\n",

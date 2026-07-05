@@ -11,7 +11,7 @@ use common::test_data;
 fn test_phasher_cpu_mean() {
     let cpu = PHasherCpu::new(HashAlgorithm::Mean);
     let pixels = vec![128u8; 64];
-    let result = cpu.compute(&[pixels.clone()], 8, 8).unwrap();
+    let result = cpu.compute(std::slice::from_ref(&pixels), 8, 8).unwrap();
     assert_eq!(result.len(), 1);
     let expected = hash_reference::mean_hash(&pixels, 8, 8);
     assert_eq!(result[0], expected);
@@ -21,7 +21,7 @@ fn test_phasher_cpu_mean() {
 fn test_phasher_cpu_median() {
     let cpu = PHasherCpu::new(HashAlgorithm::Median);
     let pixels = test_data::gradient_image(64);
-    let result = cpu.compute(&[pixels.clone()], 8, 8).unwrap();
+    let result = cpu.compute(std::slice::from_ref(&pixels), 8, 8).unwrap();
     assert_eq!(result.len(), 1);
     let expected = hash_reference::median_hash(&pixels, 8, 8);
     assert_eq!(result[0], expected);
@@ -31,7 +31,7 @@ fn test_phasher_cpu_median() {
 fn test_phasher_cpu_gradient() {
     let cpu = PHasherCpu::new(HashAlgorithm::Gradient);
     let pixels = test_data::gradient_image(8 * 9);
-    let result = cpu.compute(&[pixels.clone()], 8, 9).unwrap();
+    let result = cpu.compute(std::slice::from_ref(&pixels), 8, 9).unwrap();
     assert_eq!(result.len(), 1);
     let expected = hash_reference::gradient_hash(&pixels, 8, 9);
     assert_eq!(result[0], expected);
@@ -41,7 +41,7 @@ fn test_phasher_cpu_gradient() {
 fn test_phasher_cpu_block() {
     let cpu = PHasherCpu::new(HashAlgorithm::Block);
     let pixels = test_data::gradient_image(16 * 16);
-    let result = cpu.compute(&[pixels.clone()], 16, 16).unwrap();
+    let result = cpu.compute(std::slice::from_ref(&pixels), 16, 16).unwrap();
     assert_eq!(result.len(), 1);
     let expected = hash_reference::block_hash(&pixels, 16, 16);
     assert_eq!(result[0], expected);
@@ -51,7 +51,7 @@ fn test_phasher_cpu_block() {
 fn test_phasher_cpu_vert_gradient() {
     let cpu = PHasherCpu::new(HashAlgorithm::VertGradient);
     let pixels = test_data::gradient_image(9 * 8);
-    let result = cpu.compute(&[pixels.clone()], 9, 8).unwrap();
+    let result = cpu.compute(std::slice::from_ref(&pixels), 9, 8).unwrap();
     assert_eq!(result.len(), 1);
     let expected = hash_reference::vert_gradient_hash(&pixels, 9, 8);
     assert_eq!(result[0], expected);
@@ -61,7 +61,7 @@ fn test_phasher_cpu_vert_gradient() {
 fn test_phasher_cpu_double_gradient() {
     let cpu = PHasherCpu::new(HashAlgorithm::DoubleGradient);
     let pixels = test_data::gradient_image(9 * 9);
-    let result = cpu.compute(&[pixels.clone()], 9, 9).unwrap();
+    let result = cpu.compute(std::slice::from_ref(&pixels), 9, 9).unwrap();
     assert_eq!(result.len(), 1);
     let expected = hash_reference::double_gradient_hash(&pixels, 9, 9);
     assert_eq!(result[0], expected);
@@ -176,7 +176,7 @@ fn test_phasher_cpu_matches_gpu() {
         let pixels = test_data::random_image((w * h) as usize);
         let dimensions = vec![(w, h)];
 
-        let gpu_result = hasher.compute(&ctx, &[pixels.clone()], &dimensions)
+        let gpu_result = hasher.compute(&ctx, std::slice::from_ref(&pixels), &dimensions)
             .unwrap_or_else(|e| panic!("{:?} GPU 计算失败: {}", algo, e));
         let cpu_result = cpu.compute(&[pixels], w, h)
             .unwrap_or_else(|e| panic!("{:?} CPU 计算失败: {}", algo, e));

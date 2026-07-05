@@ -1,0 +1,74 @@
+---
+pid: 4320
+cwd: "d:\Code\AI\wgpu-tool"
+command: "cd d:\Code\AI\wgpu-tool; $env:RUST_LOG="warn"; cargo run --example similar_images --features czkawka-compat -- "D:\Download\pic" --zero-copy --resize lanczos3 -s 32 -a gradient -t 10 -r --memory-budget 512 --sub-batch-size 16 2>&1"
+started_at: 2026-07-04T14:01:30.865Z
+---
+╔══════════════════════════════════════════════════════════╗
+║     similar_images — GPU 加速相似图像检测工具           ║
+╚══════════════════════════════════════════════════════════╝
+
+[1/4] 扫描图像文件...
+      目录: D:\Download\pic
+      递归: 是
+warning: use of deprecated function `buffer::download_batch`: 每次调用创建/销毁暂存缓冲区，请使用 download_batch_with_pool 替代
+   --> src\lib.rs:196:17
+    |
+196 | pub use buffer::download_batch;
+    |                 ^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: unused variable: `cpu_fn`
+  --> src\backend_dispatcher.rs:52:9
+   |
+52 |         cpu_fn: C,
+   |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_cpu_fn`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `gpgpu-tool` (lib) generated 2 warnings (run `cargo fix --lib -p gpgpu-tool` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.97s
+     Running `target\debug\examples\similar_images.exe D:\Download\pic --zero-copy --resize lanczos3 -s 32 -a gradient -t 10 -r --memory-budget 512 --sub-batch-size 16`
+      找到 187699 个图像文件 (39.17s)
+
+[2/4] 初始化 GPU 加速器...
+      算法: Gradient (czkawka 名: Gradient)
+      哈希尺寸: 32 (1024-bit)
+      容差: 10
+      缩放算法: Lanczos3 高质量缩放 (CPU)
+      零拷贝模式: 是 (流水线优化, 子批=16)
+      内存预算: 512 MB
+[2026-07-04T14:02:11Z WARN  wgpu_hal::vulkan::instance] InstanceFlags::VALIDATION requested, but unable to find layer: VK_LAYER_KHRONOS_validation
+[2026-07-04T14:02:11Z ERROR wgpu_hal::vulkan::instance] GENERAL [Loader Message (0x0)]
+    	loader_get_json: Failed to open JSON file C:\VulkanSDK\1.4.313.2\Bin\VkLayer_api_dump.json
+[2026-07-04T14:02:11Z ERROR wgpu_hal::vulkan::instance] 	objects: (type: INSTANCE, hndl: 0x53e1980, name: ?)
+[2026-07-04T14:02:11Z ERROR wgpu_hal::vulkan::instance] GENERAL [Loader Message (0x0)]
+    	loader_get_json: Failed to open JSON file C:\VulkanSDK\1.4.313.2\Bin\VkLayer_gfxreconstruct.json
+[2026-07-04T14:02:11Z ERROR wgpu_hal::vulkan::instance] 	objects: (type: INSTANCE, hndl: 0x53e1980, name: ?)
+[2026-07-04T14:02:11Z ERROR wgpu_hal::vulkan::instance] GENERAL [Loader Message (0x0)]
+    	loader_get_json: Failed to open JSON file C:\VulkanSDK\1.4.313.2\Bin\VkLayer_khronos_synchronization2.json
+[2026-07-04T14:02:11Z ERROR wgpu_hal::vulkan::instance] 	objects: (type: INSTANCE, hndl: 0x53e1980, name: ?)
+[2026-07-04T14:02:11Z ERROR wgpu_hal::vulkan::instance] GENERAL [Loader Message (0x0)]
+    	loader_get_json: Failed to open JSON file C:\VulkanSDK\1.4.313.2\Bin\VkLayer_khronos_validation.json
+[2026-07-04T14:02:11Z ERROR wgpu_hal::vulkan::instance] 	objects: (type: INSTANCE, hndl: 0x53e1980, name: ?)
+[2026-07-04T14:02:11Z ERROR wgpu_hal::vulkan::instance] GENERAL [Loader Message (0x0)]
+    	loader_get_json: Failed to open JSON file C:\VulkanSDK\1.4.313.2\Bin\VkLayer_monitor.json
+[2026-07-04T14:02:11Z ERROR wgpu_hal::vulkan::instance] 	objects: (type: INSTANCE, hndl: 0x53e1980, name: ?)
+[2026-07-04T14:02:11Z ERROR wgpu_hal::vulkan::instance] GENERAL [Loader Message (0x0)]
+    	loader_get_json: Failed to open JSON file C:\VulkanSDK\1.4.313.2\Bin\VkLayer_screenshot.json
+[2026-07-04T14:02:11Z ERROR wgpu_hal::vulkan::instance] 	objects: (type: INSTANCE, hndl: 0x53e1980, name: ?)
+[2026-07-04T14:02:11Z ERROR wgpu_hal::vulkan::instance] GENERAL [Loader Message (0x0)]
+    	loader_get_json: Failed to open JSON file C:\VulkanSDK\1.4.313.2\Bin\VkLayer_khronos_profiles.json
+[2026-07-04T14:02:11Z ERROR wgpu_hal::vulkan::instance] 	objects: (type: INSTANCE, hndl: 0x53e1980, name: ?)
+[2026-07-04T14:02:11Z ERROR wgpu_hal::vulkan::instance] GENERAL [Loader Message (0x0)]
+    	loader_get_json: Failed to open JSON file C:\VulkanSDK\1.4.313.2\Bin\VkLayer_khronos_shader_object.json
+[2026-07-04T14:02:11Z ERROR wgpu_hal::vulkan::instance] 	objects: (type: INSTANCE, hndl: 0x53e1980, name: ?)
+[2026-07-04T14:02:11Z ERROR wgpu_hal::vulkan::instance] GENERAL [Loader Message (0x0)]
+    	loader_get_json: Failed to open JSON file C:\VulkanSDK\1.4.313.2\Bin\VkLayer_crash_diagnostic.json
+[2026-07-04T14:02:11Z ERROR wgpu_hal::vulkan::instance] 	objects: (type: INSTANCE, hndl: 0x53e1980, name: ?)
+[2026-07-04T14:02:12Z WARN  gpgpu_tool::context] 适配器声明支持 PUSH_CONSTANTS，但设备实际不可用，降级到 Uniform buffer
+      GPU 适配器: AMD Radeon RX 5700 (Vulkan)
+
+[3/4] 流式分批加载 + GPU 感知哈希计算...
+      模式: 零拷贝 GPU 流水线（CPU/GPU 双缓冲, 子批=16, 峰值 CPU 内存 = 16 张图像）

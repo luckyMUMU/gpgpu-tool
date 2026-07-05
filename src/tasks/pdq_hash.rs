@@ -110,6 +110,31 @@ impl PdqHashGpu {
     /// 每张图像输出 `hash_size.u64s_per_image()` 个 u64（PDQ 固定为 4 个 u64 = 256-bit）。
     /// 当 `hash_size != 16` 时返回错误，因为 PDQ 算法固定输出 256-bit 哈希。
     pub fn compute(&self, ctx: &GpuContext, images: &[Vec<u8>], hash_size: HashSize) -> Result<Vec<u64>, GpuError> {
+        let results = self.compute_inner(ctx, images, hash_size)?;
+        Ok(results.into_iter().flat_map(|r| r.hash.to_vec()).collect())
+    }
+
+    /// 计算 PDQ 哈希并返回包含质量评分的结果。
+    ///
+    /// 与 [`compute`](PdqHashGpu::compute) 使用相同的 GPU DCT 管线，
+    /// 但返回完整的 [`PdqHashResult`]（含 `quality` 字段），
+    /// 而非仅返回 u64 哈希值。
+    pub fn compute_with_quality(
+        &self,
+        ctx: &GpuContext,
+        images: &[Vec<u8>],
+        hash_size: HashSize,
+    ) -> Result<Vec<PdqHashResult>, GpuError> {
+        self.compute_inner(ctx, images, hash_size)
+    }
+
+    /// 内部实现：返回完整的 PdqHashResult（含 quality）。
+    fn compute_inner(
+        &self,
+        ctx: &GpuContext,
+        images: &[Vec<u8>],
+        hash_size: HashSize,
+    ) -> Result<Vec<PdqHashResult>, GpuError> {
         if hash_size.size() != 16 {
             return Err(GpuError::InvalidInput(format!(
                 "PDQ 哈希固定为 16×16=256 bit，不支持 hash_size={}（期望 16）",
@@ -141,9 +166,9 @@ impl PdqHashGpu {
 
         let buffer_size = (all_pixels.len() * 4) as u64;
 
-        let input_raw = ctx.buffer_pool().acquire(device, buffer_size, BufferUsage::Storage);
-        let intermediate_raw = ctx.buffer_pool().acquire(device, buffer_size, BufferUsage::Storage);
-        let output_raw = ctx.buffer_pool().acquire(device, buffer_size, BufferUsage::Storage);
+        let input_raw = ctx.buffer_pool().acquire(device, buffer_size, BufferUsage::Storage)?;
+        let intermediate_raw = ctx.buffer_pool().acquire(device, buffer_size, BufferUsage::Storage)?;
+        let output_raw = ctx.buffer_pool().acquire(device, buffer_size, BufferUsage::Storage)?;
 
         queue.write_buffer(&input_raw, 0, bytemuck::cast_slice(&all_pixels));
 
@@ -203,7 +228,7 @@ impl PdqHashGpu {
         let raw_u32 = bytemuck::cast_slice::<u8, u32>(&result);
         let dct_f32: Vec<f32> = raw_u32.iter().map(|&v| f32::from_bits(v)).collect();
 
-        let mut hashes = Vec::with_capacity(image_count * 4);
+        let mut results = Vec::with_capacity(image_count);
         for img_idx in 0..image_count {
             let offset = img_idx * pixels_per_image;
 
@@ -220,10 +245,12 @@ impl PdqHashGpu {
 
             let bits: Vec<bool> = coefficients.iter().map(|&c| c >= median).collect();
             let hash = pack_bits_to_u64(&bits);
-            hashes.extend_from_slice(&hash);
+            let quality = compute_quality(&coefficients, median);
+
+            results.push(PdqHashResult { hash, quality });
         }
 
-        Ok(hashes)
+        Ok(results)
     }
 }
 

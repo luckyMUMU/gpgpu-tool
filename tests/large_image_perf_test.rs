@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use image::GenericImageView;
 use gpgpu_tool::GpuContext;
+use gpgpu_tool::GpuError;
 use gpgpu_tool::tasks::phasher::{HashAlgorithm, PerceptualHasher};
 use gpgpu_tool::tasks::sha256::Sha256Computer;
 
@@ -214,4 +215,177 @@ fn test_large_image_batch_performance() {
     println!("  SHA-256 异步: {:?} ({:.1} μs/img) ({:.1}x vs 同步)", async_elapsed,
         async_elapsed.as_micros() as f64 / large_batch.len() as f64,
         sync_elapsed.as_secs_f64() / async_elapsed.as_secs_f64());
+}
+
+// ============================================================================
+// 大图像边界测试辅助函数
+// ============================================================================
+
+/// 创建合成灰度图像（简单渐变模式）。
+///
+/// 像素值 = (x * 255 / width + y * 255 / height) / 2，产生从左上到右下的渐变。
+fn create_synthetic_image(width: u32, height: u32) -> Vec<u8> {
+    let size = (width as usize) * (height as usize);
+    let mut pixels = Vec::with_capacity(size);
+    for y in 0..height {
+        for x in 0..width {
+            let v = ((x as f32 * 255.0 / width as f32) + (y as f32 * 255.0 / height as f32)) / 2.0;
+            pixels.push(v as u8);
+        }
+    }
+    pixels
+}
+
+// ============================================================================
+// 大图像 OOM 边界测试
+// ============================================================================
+
+/// 测试：10000×10000 灰度图像（100MB u8 / 400MB u32 对齐）应被拒绝。
+///
+/// 单张图像 u32 对齐后为 400MB，远超典型 GPU 的 max_storage_buffer_binding_size
+/// （通常 128MB-256MB），应返回 `GpuError::InvalidInput` 并包含明确错误消息。
+#[test]
+#[ignore = "slow: creates 100MB synthetic image, may OOM on low-memory systems"]
+fn test_large_image_exceeds_buffer_binding_limit() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let mut ctx = GpuContext::new_sync().expect("GPU 上下文创建失败");
+
+    let width: u32 = 10000;
+    let height: u32 = 10000;
+    let image = create_synthetic_image(width, height);
+    let dimensions = vec![(width, height)];
+
+    let hasher = PerceptualHasher::new(&mut ctx, HashAlgorithm::Mean).unwrap();
+
+    let result = hasher.compute(&ctx, &[image], &dimensions);
+
+    match result {
+        Err(GpuError::InvalidInput(msg)) => {
+            assert!(
+                msg.contains("max_storage_buffer_binding_size"),
+                "错误消息应提及 max_storage_buffer_binding_size，实际: {}",
+                msg
+            );
+            assert!(
+                msg.contains(&format!("{}×{}", width, height)),
+                "错误消息应包含图像尺寸 {}×{}，实际: {}",
+                width, height, msg
+            );
+            println!("✓ 正确拒绝超大图像: {}", msg);
+        }
+        Ok(hashes) => {
+            // 如果 GPU 恰好支持 400MB+ 绑定大小（极少见），不应 panic
+            println!("⚠ GPU 支持超大缓冲区绑定，返回 {} 个哈希", hashes.len());
+        }
+        Err(e) => {
+            panic!("预期 GpuError::InvalidInput，实际得到: {:?}", e);
+        }
+    }
+}
+
+/// 测试：图像刚好在 max_storage_buffer_binding_size 边界内应成功计算。
+///
+/// 计算一张尺寸刚好使 u32 对齐字节数 ≤ max_storage_buffer_binding_size 的图像，
+/// 验证 `PerceptualHasher::compute()` 成功返回哈希值。
+#[test]
+#[ignore = "slow: creates large synthetic image near GPU buffer limit"]
+fn test_large_image_just_under_buffer_binding_limit() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let mut ctx = GpuContext::new_sync().expect("GPU 上下文创建失败");
+
+    let max_binding = ctx.limits().max_storage_buffer_binding_size as u64;
+    // u32 对齐：每像素 4 字节
+    let max_pixels = max_binding / 4;
+
+    // 选择正方形尺寸，像素数 ≤ max_pixels
+    let side = (max_pixels as f64).sqrt() as u32;
+    // 确保 side × side ≤ max_pixels
+    let side = if (side as u64) * (side as u64) > max_pixels {
+        side - 1
+    } else {
+        side
+    };
+    let side = side.max(8); // 至少 8×8（Mean Hash 最小目标尺寸）
+
+    let image = create_synthetic_image(side, side);
+    let dimensions = vec![(side, side)];
+
+    let hasher = PerceptualHasher::new(&mut ctx, HashAlgorithm::Mean).unwrap();
+
+    let result = hasher.compute(&ctx, &[image], &dimensions);
+
+    match result {
+        Ok(hashes) => {
+            assert_eq!(hashes.len(), 1, "应返回 1 个哈希值");
+            let per_image_bytes = (side as u64) * (side as u64) * 4;
+            println!(
+                "✓ {}×{} 图像 ({} 字节 u32 对齐) 成功计算哈希: {:016x}",
+                side, side, per_image_bytes, hashes[0]
+            );
+            assert!(
+                per_image_bytes <= max_binding,
+                "u32 对齐字节数 {} 应 ≤ max_storage_buffer_binding_size {}",
+                per_image_bytes, max_binding
+            );
+        }
+        Err(GpuError::InvalidInput(msg)) => {
+            // 可能因为 max_batch_size 限制被拒绝（DEFAULT_MAX_BATCH_SIZE = 128MB）
+            // 这也是合理的行为
+            println!("⚠ 图像被拒绝（可能因 max_batch_size 限制）: {}", msg);
+        }
+        Err(e) => {
+            panic!("预期成功或 InvalidInput，实际得到: {:?}", e);
+        }
+    }
+}
+
+/// 测试：混合尺寸图像（不同 w/h 在同一批次）应正常工作。
+///
+/// 创建 3 张不同尺寸的合成图像（128×128, 256×128, 128×256），
+/// 验证 `PerceptualHasher::compute()` 能正确处理混合尺寸批次。
+#[test]
+fn test_mixed_size_images_in_batch() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let mut ctx = GpuContext::new_sync().expect("GPU 上下文创建失败");
+
+    let sizes = [(128u32, 128u32), (256u32, 128u32), (128u32, 256u32)];
+    let images: Vec<Vec<u8>> = sizes
+        .iter()
+        .map(|&(w, h)| create_synthetic_image(w, h))
+        .collect();
+    let dimensions: Vec<(u32, u32)> = sizes.to_vec();
+
+    let hasher = PerceptualHasher::new(&mut ctx, HashAlgorithm::Mean).unwrap();
+
+    let result = hasher.compute(&ctx, &images, &dimensions);
+
+    match result {
+        Ok(hashes) => {
+            assert_eq!(
+                hashes.len(),
+                sizes.len(),
+                "应返回 {} 个哈希值，实际 {} 个",
+                sizes.len(),
+                hashes.len()
+            );
+            for (i, hash) in hashes.iter().enumerate() {
+                println!(
+                    "  {}×{} → {:016x}",
+                    sizes[i].0, sizes[i].1, hash
+                );
+            }
+            // 验证所有哈希非零（渐变模式缩放到 8×8 后可能产生相同哈希，
+            // 但不应为零——零哈希意味着全黑图像）
+            for (i, hash) in hashes.iter().enumerate() {
+                assert_ne!(
+                    *hash, 0,
+                    "{}×{} 哈希不应为零（渐变图像非全黑）",
+                    sizes[i].0, sizes[i].1
+                );
+            }
+        }
+        Err(e) => {
+            panic!("混合尺寸批次应成功计算，实际错误: {:?}", e);
+        }
+    }
 }

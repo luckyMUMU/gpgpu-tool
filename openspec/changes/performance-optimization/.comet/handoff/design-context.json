@@ -1,0 +1,13 @@
+{
+  "change": "performance-optimization",
+  "phase": "design",
+  "mode": "compact",
+  "canonical_spec": "openspec",
+  "generated_by": "comet-handoff.sh",
+  "context_hash": "2630118d8aadfaa19f9fbb61a48fcf2026756b53af7854ec8c29c4fe03aa0ca4",
+  "files": [
+    { "path": "openspec/changes/performance-optimization/proposal.md", "sha256": "f9455ccdd0467b4117d8dccce5f2a755cac05275c9475e52e322b895cc3e0161" },
+    { "path": "openspec/changes/performance-optimization/design.md", "sha256": "79d94e23d692655ca73a38f9a17860d5d64ee8fb2ee42de9ed3b12c39a42dbd5" },
+    { "path": "openspec/changes/performance-optimization/tasks.md", "sha256": "491243e8f7a343393b8574ea275dd9f73cb5fbe39be7996b9108bdf8d348851f" }
+  ]
+}

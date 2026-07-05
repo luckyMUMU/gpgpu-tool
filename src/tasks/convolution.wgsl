@@ -2,6 +2,10 @@
 // 支持三种边界模式（Zero/Clamp/Reflect）和三种通道模式（2D/水平1D/垂直1D）
 // 2D workgroup 布局：gid.x = x, gid.y = y
 // separable_fused 入口点使用 LDS 共享内存优化可分离卷积
+//
+// 性能限制：ConvParams 内联 124 个 f32 kernel 数据（最大支持 11×11），
+// 小 kernel 时浪费显存带宽（始终传输 496 字节）。
+// 优化方向：将 kernel 数据分离到独立 storage buffer，按实际大小传输。
 
 struct ConvParams {
     width: u32,

@@ -158,7 +158,7 @@ fn test_pipeline_different_algorithms() {
         let hashes = GpuPipelineBuilder::new()
             .resize(tw, th)
             .hash(algorithm, HashSize::default())
-            .execute(&mut ctx, &[pixels.clone()], &[width], &[height])
+            .execute(&mut ctx, std::slice::from_ref(&pixels), &[width], &[height])
             .unwrap_or_else(|_| panic!("{:?} 算法管线执行失败", algorithm));
 
         assert!(!hashes.is_empty(), "{:?} 算法应返回哈希值", algorithm);

@@ -1,7 +1,7 @@
 /// 合成图像数据生成器，用于测试。
 ///
 /// 提供多种生成模式，支持任意尺寸，保证测试可复现。
-
+///
 /// 生成全相同像素的图像。
 pub fn uniform_image(size: usize, value: u8) -> Vec<u8> {
     vec![value; size]

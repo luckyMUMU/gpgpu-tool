@@ -46,44 +46,99 @@ impl PHasherCpu {
         let u32s_per_image = self.hash_size.u32s_per_image() as usize;
         let u64s_per_image = self.hash_size.u64s_per_image() as usize;
 
-        let mut all_hashes = Vec::with_capacity(images.len() * u64s_per_image);
-        for image in images {
-            let hash_u32s = match self.algorithm {
-                HashAlgorithm::Mean => mean_hash_cpu(image, width, height, hash_bits),
-                HashAlgorithm::Median => median_hash_cpu(image, width, height, hash_bits),
-                HashAlgorithm::Gradient => gradient_hash_cpu(image, width, height, hash_bits),
-                HashAlgorithm::Block => {
-                    block_hash_cpu(image, width, height, hash_bits, self.hash_size.size())
-                }
-                HashAlgorithm::VertGradient => vert_gradient_hash_cpu(image, width, height, hash_bits),
-                HashAlgorithm::DoubleGradient => {
-                    double_gradient_hash_cpu(image, width, height, hash_bits)
-                }
-                #[cfg(feature = "pdq")]
-                HashAlgorithm::Pdq => {
-                    let pdq = PdqHashCpu::new();
-                    let result = pdq.compute(image)?;
-                    let mut hash_u32s = vec![0u32; 8];
-                    for (i, &val) in result.hash.iter().enumerate() {
-                        hash_u32s[i * 2] = val as u32;
-                        hash_u32s[i * 2 + 1] = (val >> 32) as u32;
-                    }
-                    hash_u32s
-                }
-            };
+        #[cfg(feature = "parallel-cpu")]
+        {
+            use rayon::prelude::*;
+            let image_results: Vec<Vec<u64>> = images
+                .par_iter()
+                .map(|image| {
+                    let hash_u32s = match self.algorithm {
+                        HashAlgorithm::Mean => mean_hash_cpu(image, width, height, hash_bits),
+                        HashAlgorithm::Median => median_hash_cpu(image, width, height, hash_bits),
+                        HashAlgorithm::Gradient => {
+                            gradient_hash_cpu(image, width, height, hash_bits)
+                        }
+                        HashAlgorithm::Block => {
+                            block_hash_cpu(image, width, height, hash_bits, self.hash_size.size())
+                        }
+                        HashAlgorithm::VertGradient => {
+                            vert_gradient_hash_cpu(image, width, height, hash_bits)
+                        }
+                        HashAlgorithm::DoubleGradient => {
+                            double_gradient_hash_cpu(image, width, height, hash_bits)
+                        }
+                        #[cfg(feature = "pdq")]
+                        HashAlgorithm::Pdq => {
+                            let pdq = PdqHashCpu::new();
+                            let result = pdq.compute(image).unwrap();
+                            let mut hash_u32s = vec![0u32; 8];
+                            for (i, &val) in result.hash.iter().enumerate() {
+                                hash_u32s[i * 2] = val as u32;
+                                hash_u32s[i * 2 + 1] = (val >> 32) as u32;
+                            }
+                            hash_u32s
+                        }
+                    };
 
-            for chunk in 0..u64s_per_image {
-                let lo_idx = chunk * 2;
-                let low = hash_u32s[lo_idx] as u64;
-                let high = if lo_idx + 1 < u32s_per_image {
-                    hash_u32s[lo_idx + 1] as u64
-                } else {
-                    0
-                };
-                all_hashes.push(low | (high << 32));
-            }
+                    let mut hashes = Vec::with_capacity(u64s_per_image);
+                    for chunk in 0..u64s_per_image {
+                        let lo_idx = chunk * 2;
+                        let low = hash_u32s[lo_idx] as u64;
+                        let high = if lo_idx + 1 < u32s_per_image {
+                            hash_u32s[lo_idx + 1] as u64
+                        } else {
+                            0
+                        };
+                        hashes.push(low | (high << 32));
+                    }
+                    hashes
+                })
+                .collect();
+            Ok(image_results.into_iter().flatten().collect())
         }
-        Ok(all_hashes)
+        #[cfg(not(feature = "parallel-cpu"))]
+        {
+            let mut all_hashes = Vec::with_capacity(images.len() * u64s_per_image);
+            for image in images {
+                let hash_u32s = match self.algorithm {
+                    HashAlgorithm::Mean => mean_hash_cpu(image, width, height, hash_bits),
+                    HashAlgorithm::Median => median_hash_cpu(image, width, height, hash_bits),
+                    HashAlgorithm::Gradient => gradient_hash_cpu(image, width, height, hash_bits),
+                    HashAlgorithm::Block => {
+                        block_hash_cpu(image, width, height, hash_bits, self.hash_size.size())
+                    }
+                    HashAlgorithm::VertGradient => {
+                        vert_gradient_hash_cpu(image, width, height, hash_bits)
+                    }
+                    HashAlgorithm::DoubleGradient => {
+                        double_gradient_hash_cpu(image, width, height, hash_bits)
+                    }
+                    #[cfg(feature = "pdq")]
+                    HashAlgorithm::Pdq => {
+                        let pdq = PdqHashCpu::new();
+                        let result = pdq.compute(image)?;
+                        let mut hash_u32s = vec![0u32; 8];
+                        for (i, &val) in result.hash.iter().enumerate() {
+                            hash_u32s[i * 2] = val as u32;
+                            hash_u32s[i * 2 + 1] = (val >> 32) as u32;
+                        }
+                        hash_u32s
+                    }
+                };
+
+                for chunk in 0..u64s_per_image {
+                    let lo_idx = chunk * 2;
+                    let low = hash_u32s[lo_idx] as u64;
+                    let high = if lo_idx + 1 < u32s_per_image {
+                        hash_u32s[lo_idx + 1] as u64
+                    } else {
+                        0
+                    };
+                    all_hashes.push(low | (high << 32));
+                }
+            }
+            Ok(all_hashes)
+        }
     }
 
     /// 返回算法类型。
@@ -331,4 +386,61 @@ fn double_gradient_hash_cpu(
     }
 
     hash_u32s
+}
+
+/// CPU 高斯模糊（5×5 核，Clamp 边界模式）。
+///
+/// 与 GPU 端 `GpuGaussianBlur` 逻辑一致：生成 2D 高斯核后直接卷积，
+/// 边界像素使用 clamp 处理（与 GPU 的 `BorderMode::Clamp` 一致）。
+pub(crate) fn cpu_gaussian_blur(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    sigma: f32,
+) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let pixel_count = w * h;
+
+    if pixel_count == 0 || pixels.len() < pixel_count {
+        return pixels.to_vec();
+    }
+
+    const KERNEL_SIZE: usize = 5;
+    let radius = (KERNEL_SIZE / 2) as i32;
+
+    // 生成 2D 高斯核
+    let mut kernel = [[0.0f32; KERNEL_SIZE]; KERNEL_SIZE];
+    let mut kernel_sum = 0.0f32;
+    for ky in -radius..=radius {
+        for kx in -radius..=radius {
+            let dist_sq = (kx * kx + ky * ky) as f32;
+            let val = (-dist_sq / (2.0 * sigma * sigma)).exp();
+            kernel[(ky + radius) as usize][(kx + radius) as usize] = val;
+            kernel_sum += val;
+        }
+    }
+    // 归一化
+    for row in &mut kernel {
+        for v in row {
+            *v /= kernel_sum;
+        }
+    }
+
+    let mut output = vec![0u8; pixel_count];
+    for py in 0..h {
+        for px in 0..w {
+            let mut acc = 0.0f32;
+            for ky in -radius..=radius {
+                for kx in -radius..=radius {
+                    let sy = (py as i32 + ky).clamp(0, h as i32 - 1) as usize;
+                    let sx = (px as i32 + kx).clamp(0, w as i32 - 1) as usize;
+                    acc += pixels[sy * w + sx] as f32
+                        * kernel[(ky + radius) as usize][(kx + radius) as usize];
+                }
+            }
+            output[py * w + px] = acc.clamp(0.0, 255.0) as u8;
+        }
+    }
+    output
 }

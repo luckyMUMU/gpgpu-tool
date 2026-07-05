@@ -3,9 +3,16 @@
 //! 提供基于 wgpu 的 GPU 并行加速业务算法。
 
 pub mod bktree;
+pub mod bktree_bytes;
 pub mod dihedral;
+pub mod gpu_image_matcher;
+pub mod gpu_matcher;
+pub mod hash_bytes;
 pub mod matcher;
+pub mod matcher_bytes;
 pub mod phasher;
+pub(crate) mod phasher_pipeline;
+pub(crate) mod phasher_util;
 pub mod sha256;
 
 #[cfg(feature = "cpu-fallback")]

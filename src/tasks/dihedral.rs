@@ -209,6 +209,262 @@ fn unpack_u64_array_to_16x16(hash: &[u64; 4]) -> Vec<bool> {
     bits
 }
 
+// ── 32×32 位矩阵操作（u64 bit manipulation）────────────────────
+
+/// 将 32×32 位矩阵打包为 16 个 u64（LSB-first）
+fn pack_32x32(bits: &[bool]) -> [u64; 16] {
+    let mut result = [0u64; 16];
+    for i in 0..1024 {
+        if bits[i] {
+            result[i / 64] |= 1u64 << (i % 64);
+        }
+    }
+    result
+}
+
+/// 将 16 个 u64 解包为 32×32 位矩阵（LSB-first）
+/// 注意：此函数在 Vec<bool>→u64 位操作迁移后不再使用，
+/// 保留用于测试和外部兼容性。
+#[allow(dead_code)]
+fn unpack_u64_array_to_32x32(hash: &[u64; 16]) -> Vec<bool> {
+    let mut bits = vec![false; 1024];
+    for chunk in 0..16 {
+        for bit in 0..64 {
+            bits[chunk * 64 + bit] = (hash[chunk] >> bit) & 1 == 1;
+        }
+    }
+    bits
+}
+
+/// Extract 32 rows of 32 bits each from [u64; 16].
+/// Each u64 holds 2 rows: bits 0-31 = row 2k, bits 32-63 = row 2k+1.
+fn extract_rows_32x32(hash: &[u64; 16]) -> [u32; 32] {
+    let mut rows = [0u32; 32];
+    for r in 0..32 {
+        let word = hash[r / 2];
+        let shift = (r % 2) * 32;
+        rows[r] = ((word >> shift) & 0xFFFF_FFFF) as u32;
+    }
+    rows
+}
+
+/// Pack 32 rows of 32 bits each back into [u64; 16].
+fn pack_rows_32x32(rows: &[u32; 32]) -> [u64; 16] {
+    let mut result = [0u64; 16];
+    for r in 0..32 {
+        result[r / 2] |= (rows[r] as u64) << ((r % 2) * 32);
+    }
+    result
+}
+
+/// In-place delta-swap transpose of a 32×32 bit matrix stored as [u32; 32].
+fn transpose_32x32(mat: &mut [u32; 32]) {
+    let mut m: u32 = 0x0000_FFFF;
+    let mut j: usize = 16;
+    while j != 0 {
+        for k in 0..32 {
+            let k2 = k ^ j;
+            if k < k2 {
+                let t = (mat[k] ^ (mat[k2] >> j)) & m;
+                mat[k] ^= t;
+                mat[k2] ^= t << j;
+            }
+        }
+        j >>= 1;
+        m ^= m << j;
+    }
+}
+
+/// Reverse bits within each u32 row (horizontal flip of a 32-bit row).
+fn reverse_bits_u32_rows(mat: &mut [u32; 32]) {
+    for row in mat.iter_mut() {
+        *row = row.reverse_bits();
+    }
+}
+
+/// Reverse the order of rows (vertical flip).
+fn reverse_rows_32(mat: &mut [u32; 32]) {
+    mat.reverse();
+}
+
+/// 顺时针旋转 90°（32×32）：转置 + 每行位反转
+fn rotate_90_cw_32x32(hash: &[u64; 16]) -> [u64; 16] {
+    let mut rows = extract_rows_32x32(hash);
+    transpose_32x32(&mut rows);
+    reverse_bits_u32_rows(&mut rows);
+    pack_rows_32x32(&rows)
+}
+
+/// 旋转 180°（32×32）：行反转 + 每行位反转
+fn rotate_180_32x32(hash: &[u64; 16]) -> [u64; 16] {
+    let mut rows = extract_rows_32x32(hash);
+    reverse_rows_32(&mut rows);
+    reverse_bits_u32_rows(&mut rows);
+    pack_rows_32x32(&rows)
+}
+
+/// 顺时针旋转 270°（32×32）：每行位反转 + 转置
+fn rotate_270_cw_32x32(hash: &[u64; 16]) -> [u64; 16] {
+    let mut rows = extract_rows_32x32(hash);
+    reverse_bits_u32_rows(&mut rows);
+    transpose_32x32(&mut rows);
+    pack_rows_32x32(&rows)
+}
+
+/// 水平翻转（32×32）：每行位反转
+fn flip_horizontal_32x32(hash: &[u64; 16]) -> [u64; 16] {
+    let mut rows = extract_rows_32x32(hash);
+    reverse_bits_u32_rows(&mut rows);
+    pack_rows_32x32(&rows)
+}
+
+/// 垂直翻转（32×32）：行反转
+fn flip_vertical_32x32(hash: &[u64; 16]) -> [u64; 16] {
+    let mut rows = extract_rows_32x32(hash);
+    reverse_rows_32(&mut rows);
+    pack_rows_32x32(&rows)
+}
+
+/// 主对角线翻转（32×32）：转置
+fn flip_diagonal_32x32(hash: &[u64; 16]) -> [u64; 16] {
+    let mut rows = extract_rows_32x32(hash);
+    transpose_32x32(&mut rows);
+    pack_rows_32x32(&rows)
+}
+
+/// 反对角线翻转（32×32）：转置 + 行反转 + 每行位反转
+fn flip_anti_diagonal_32x32(hash: &[u64; 16]) -> [u64; 16] {
+    let mut rows = extract_rows_32x32(hash);
+    transpose_32x32(&mut rows);
+    reverse_rows_32(&mut rows);
+    reverse_bits_u32_rows(&mut rows);
+    pack_rows_32x32(&rows)
+}
+
+// ── 64×64 位矩阵操作（u64 bit manipulation）────────────────────
+
+/// 将 64×64 位矩阵打包为 64 个 u64（LSB-first）
+fn pack_64x64(bits: &[bool]) -> [u64; 64] {
+    let mut result = [0u64; 64];
+    for i in 0..4096 {
+        if bits[i] {
+            result[i / 64] |= 1u64 << (i % 64);
+        }
+    }
+    result
+}
+
+/// 将 64 个 u64 解包为 64×64 位矩阵（LSB-first）
+/// 注意：此函数在 Vec<bool>→u64 位操作迁移后不再使用，
+/// 保留用于测试和外部兼容性。
+#[allow(dead_code)]
+fn unpack_u64_array_to_64x64(hash: &[u64; 64]) -> Vec<bool> {
+    let mut bits = vec![false; 4096];
+    for chunk in 0..64 {
+        for bit in 0..64 {
+            bits[chunk * 64 + bit] = (hash[chunk] >> bit) & 1 == 1;
+        }
+    }
+    bits
+}
+
+/// In-place delta-swap transpose of a 64×64 bit matrix stored as [u64; 64].
+/// Each u64 is one row. After transpose, u64[i] contains column i as bits.
+fn transpose_64x64(mat: &mut [u64; 64]) {
+    let mut m: u64 = 0x00000000_FFFFFFFF;
+    let mut j: usize = 32;
+    while j != 0 {
+        for k in 0..64 {
+            let k2 = k ^ j;
+            if k < k2 {
+                let t = (mat[k] ^ (mat[k2] >> j)) & m;
+                mat[k] ^= t;
+                mat[k2] ^= t << j;
+            }
+        }
+        j >>= 1;
+        m ^= m << j;
+    }
+}
+
+/// Reverse bits within each u64 row (horizontal flip).
+fn reverse_bits_u64_rows(mat: &mut [u64; 64]) {
+    for row in mat.iter_mut() {
+        *row = row.reverse_bits();
+    }
+}
+
+/// Reverse the order of rows (vertical flip).
+fn reverse_rows_64(mat: &mut [u64; 64]) {
+    mat.reverse();
+}
+
+/// 顺时针旋转 90°（64×64）：转置 + 每行位反转
+fn rotate_90_cw_64x64(hash: &[u64; 64]) -> [u64; 64] {
+    let mut mat = *hash;
+    transpose_64x64(&mut mat);
+    reverse_bits_u64_rows(&mut mat);
+    mat
+}
+
+/// 旋转 180°（64×64）：行反转 + 每行位反转
+fn rotate_180_64x64(hash: &[u64; 64]) -> [u64; 64] {
+    let mut mat = *hash;
+    reverse_rows_64(&mut mat);
+    reverse_bits_u64_rows(&mut mat);
+    mat
+}
+
+/// 顺时针旋转 270°（64×64）：每行位反转 + 转置
+fn rotate_270_cw_64x64(hash: &[u64; 64]) -> [u64; 64] {
+    let mut mat = *hash;
+    reverse_bits_u64_rows(&mut mat);
+    transpose_64x64(&mut mat);
+    mat
+}
+
+/// 水平翻转（64×64）：每行位反转
+fn flip_horizontal_64x64(hash: &[u64; 64]) -> [u64; 64] {
+    let mut mat = *hash;
+    reverse_bits_u64_rows(&mut mat);
+    mat
+}
+
+/// 垂直翻转（64×64）：行反转
+fn flip_vertical_64x64(hash: &[u64; 64]) -> [u64; 64] {
+    let mut mat = *hash;
+    reverse_rows_64(&mut mat);
+    mat
+}
+
+/// 主对角线翻转（64×64）：转置
+fn flip_diagonal_64x64(hash: &[u64; 64]) -> [u64; 64] {
+    let mut mat = *hash;
+    transpose_64x64(&mut mat);
+    mat
+}
+
+/// 反对角线翻转（64×64）：转置 + 行反转 + 每行位反转
+fn flip_anti_diagonal_64x64(hash: &[u64; 64]) -> [u64; 64] {
+    let mut mat = *hash;
+    transpose_64x64(&mut mat);
+    reverse_rows_64(&mut mat);
+    reverse_bits_u64_rows(&mut mat);
+    mat
+}
+
+// ── 公共 Trait ────────────────────────────────────────────────────
+
+/// Trait for D4 dihedral group transforms (8 variants: identity + 3 rotations + 4 reflections).
+pub trait DihedralTransform {
+    /// The hash type this transform operates on.
+    type Hash;
+    /// Create from a single hash.
+    fn from_hash(hash: &Self::Hash) -> Self;
+    /// Return all 8 D4 variants.
+    fn all_variants(&self) -> Vec<Self::Hash>;
+}
+
 // ── 公共类型 ─────────────────────────────────────────────────────
 
 /// 64-bit 哈希（8×8 位矩阵）的二面体变换结果。
@@ -272,6 +528,18 @@ impl DihedralHashes64 {
     }
 }
 
+impl DihedralTransform for DihedralHashes64 {
+    type Hash = u64;
+
+    fn from_hash(hash: &u64) -> Self {
+        Self::from_u64(*hash)
+    }
+
+    fn all_variants(&self) -> Vec<u64> {
+        self.all().to_vec()
+    }
+}
+
 /// 256-bit 哈希（16×16 位矩阵）的二面体变换结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DihedralHashes256 {
@@ -330,6 +598,196 @@ impl DihedralHashes256 {
             self.flip_diag,
             self.flip_anti_diag,
         ]
+    }
+}
+
+impl DihedralTransform for DihedralHashes256 {
+    type Hash = [u64; 4];
+
+    fn from_hash(hash: &[u64; 4]) -> Self {
+        Self::from_u64_array(*hash)
+    }
+
+    fn all_variants(&self) -> Vec<[u64; 4]> {
+        self.all().to_vec()
+    }
+}
+
+/// 1024-bit 哈希（32×32 位矩阵）的二面体变换结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DihedralHashes1024 {
+    pub original: [u64; 16],
+    pub rotate90: [u64; 16],
+    pub rotate180: [u64; 16],
+    pub rotate270: [u64; 16],
+    pub flip_h: [u64; 16],
+    pub flip_v: [u64; 16],
+    pub flip_diag: [u64; 16],
+    pub flip_anti_diag: [u64; 16],
+}
+
+impl DihedralHashes1024 {
+    /// 从 32×32 位矩阵推导所有变体。
+    /// bits 长度必须为 1024，按行优先排列。
+    pub fn from_bits(bits: &[bool]) -> Self {
+        assert_eq!(bits.len(), 1024);
+
+        let original = pack_32x32(bits);
+        let rotate90 = rotate_90_cw_32x32(&original);
+        let rotate180 = rotate_180_32x32(&original);
+        let rotate270 = rotate_270_cw_32x32(&original);
+        let flip_h = flip_horizontal_32x32(&original);
+        let flip_v = flip_vertical_32x32(&original);
+        let flip_diag = flip_diagonal_32x32(&original);
+        let flip_anti_diag = flip_anti_diagonal_32x32(&original);
+
+        Self {
+            original,
+            rotate90,
+            rotate180,
+            rotate270,
+            flip_h,
+            flip_v,
+            flip_diag,
+            flip_anti_diag,
+        }
+    }
+
+    /// 从 16 个 u64 哈希值推导所有变体。
+    pub fn from_u64_array(hash: [u64; 16]) -> Self {
+        let rotate90 = rotate_90_cw_32x32(&hash);
+        let rotate180 = rotate_180_32x32(&hash);
+        let rotate270 = rotate_270_cw_32x32(&hash);
+        let flip_h = flip_horizontal_32x32(&hash);
+        let flip_v = flip_vertical_32x32(&hash);
+        let flip_diag = flip_diagonal_32x32(&hash);
+        let flip_anti_diag = flip_anti_diagonal_32x32(&hash);
+
+        Self {
+            original: hash,
+            rotate90,
+            rotate180,
+            rotate270,
+            flip_h,
+            flip_v,
+            flip_diag,
+            flip_anti_diag,
+        }
+    }
+
+    /// 返回所有变体。
+    pub fn all(&self) -> [[u64; 16]; 8] {
+        [
+            self.original,
+            self.rotate90,
+            self.rotate180,
+            self.rotate270,
+            self.flip_h,
+            self.flip_v,
+            self.flip_diag,
+            self.flip_anti_diag,
+        ]
+    }
+}
+
+impl DihedralTransform for DihedralHashes1024 {
+    type Hash = [u64; 16];
+
+    fn from_hash(hash: &[u64; 16]) -> Self {
+        Self::from_u64_array(*hash)
+    }
+
+    fn all_variants(&self) -> Vec<[u64; 16]> {
+        self.all().to_vec()
+    }
+}
+
+/// 4096-bit 哈希（64×64 位矩阵）的二面体变换结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DihedralHashes4096 {
+    pub original: [u64; 64],
+    pub rotate90: [u64; 64],
+    pub rotate180: [u64; 64],
+    pub rotate270: [u64; 64],
+    pub flip_h: [u64; 64],
+    pub flip_v: [u64; 64],
+    pub flip_diag: [u64; 64],
+    pub flip_anti_diag: [u64; 64],
+}
+
+impl DihedralHashes4096 {
+    /// 从 64×64 位矩阵推导所有变体。
+    /// bits 长度必须为 4096，按行优先排列。
+    pub fn from_bits(bits: &[bool]) -> Self {
+        assert_eq!(bits.len(), 4096);
+
+        let original = pack_64x64(bits);
+        let rotate90 = rotate_90_cw_64x64(&original);
+        let rotate180 = rotate_180_64x64(&original);
+        let rotate270 = rotate_270_cw_64x64(&original);
+        let flip_h = flip_horizontal_64x64(&original);
+        let flip_v = flip_vertical_64x64(&original);
+        let flip_diag = flip_diagonal_64x64(&original);
+        let flip_anti_diag = flip_anti_diagonal_64x64(&original);
+
+        Self {
+            original,
+            rotate90,
+            rotate180,
+            rotate270,
+            flip_h,
+            flip_v,
+            flip_diag,
+            flip_anti_diag,
+        }
+    }
+
+    /// 从 64 个 u64 哈希值推导所有变体。
+    pub fn from_u64_array(hash: [u64; 64]) -> Self {
+        let rotate90 = rotate_90_cw_64x64(&hash);
+        let rotate180 = rotate_180_64x64(&hash);
+        let rotate270 = rotate_270_cw_64x64(&hash);
+        let flip_h = flip_horizontal_64x64(&hash);
+        let flip_v = flip_vertical_64x64(&hash);
+        let flip_diag = flip_diagonal_64x64(&hash);
+        let flip_anti_diag = flip_anti_diagonal_64x64(&hash);
+
+        Self {
+            original: hash,
+            rotate90,
+            rotate180,
+            rotate270,
+            flip_h,
+            flip_v,
+            flip_diag,
+            flip_anti_diag,
+        }
+    }
+
+    /// 返回所有变体。
+    pub fn all(&self) -> [[u64; 64]; 8] {
+        [
+            self.original,
+            self.rotate90,
+            self.rotate180,
+            self.rotate270,
+            self.flip_h,
+            self.flip_v,
+            self.flip_diag,
+            self.flip_anti_diag,
+        ]
+    }
+}
+
+impl DihedralTransform for DihedralHashes4096 {
+    type Hash = [u64; 64];
+
+    fn from_hash(hash: &[u64; 64]) -> Self {
+        Self::from_u64_array(*hash)
+    }
+
+    fn all_variants(&self) -> Vec<[u64; 64]> {
+        self.all().to_vec()
     }
 }
 
@@ -535,5 +993,188 @@ mod tests {
         // rotate90 + flip_v = flip_diag
         assert_eq!(from_r90.flip_v, d.flip_diag,
             "rotate90 后垂直翻转应等于主对角线翻转");
+    }
+
+    // ── 32×32 测试 ──────────────────────────────────────────────
+
+    /// 辅助：构造一个 32×32 位矩阵
+    fn sample_32x32_bits() -> Vec<bool> {
+        (0..1024).map(|i| i % 7 == 0).collect()
+    }
+
+    #[test]
+    fn test_pack_unpack_32x32_roundtrip() {
+        let bits = sample_32x32_bits();
+        let hash = pack_32x32(&bits);
+        let restored = unpack_u64_array_to_32x32(&hash);
+        assert_eq!(bits, restored);
+    }
+
+    #[test]
+    fn test_rotate90_four_times_equals_original_32x32() {
+        let bits = sample_32x32_bits();
+        let hash = pack_32x32(&bits);
+        let r1 = rotate_90_cw_32x32(&hash);
+        let r2 = rotate_90_cw_32x32(&r1);
+        let r3 = rotate_90_cw_32x32(&r2);
+        let r4 = rotate_90_cw_32x32(&r3);
+        assert_eq!(r4, hash, "32×32 旋转 90° 四次应等于原始");
+    }
+
+    #[test]
+    fn test_dihedral_hashes_1024_from_u64_array_roundtrip() {
+        let hash: [u64; 16] = [
+            0x1111_2222_3333_4444, 0x5555_6666_7777_8888,
+            0x9999_AAAA_BBBB_CCCC, 0xDDDD_EEEE_FFFF_0000,
+            0x0123_4567_89AB_CDEF, 0xFEDC_BA98_7654_3210,
+            0xA1B2_C3D4_E5F6_0718, 0x1928_3746_5564_7382,
+            0x1111_1111_1111_1111, 0x2222_2222_2222_2222,
+            0x3333_3333_3333_3333, 0x4444_4444_4444_4444,
+            0x5555_5555_5555_5555, 0x6666_6666_6666_6666,
+            0x7777_7777_7777_7777, 0x8888_8888_8888_8888,
+        ];
+        let d = DihedralHashes1024::from_u64_array(hash);
+        assert_eq!(d.original, hash);
+    }
+
+    #[test]
+    fn test_dihedral_hashes_1024_all_has_eight_variants() {
+        let hash: [u64; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let d = DihedralHashes1024::from_u64_array(hash);
+        let all = d.all();
+        assert_eq!(all.len(), 8);
+    }
+
+    #[test]
+    fn test_dihedral_hashes_1024_rotate90_four_times() {
+        let hash: [u64; 16] = [
+            0xA1B2_C3D4_E5F6_0718, 0x1928_3746_5564_7382,
+            0x9101_1121_3141_5161, 0x7181_9101_A1B1_C1D1,
+            0x1111_2222_3333_4444, 0x5555_6666_7777_8888,
+            0x9999_AAAA_BBBB_CCCC, 0xDDDD_EEEE_FFFF_0000,
+            0x0123_4567_89AB_CDEF, 0xFEDC_BA98_7654_3210,
+            0xAAAA_BBBB_CCCC_DDDD, 0xEEEE_FFFF_0000_1111,
+            0x2222_3333_4444_5555, 0x6666_7777_8888_9999,
+            0x1234_5678_9ABC_DEF0, 0x0FED_CBA9_8765_4321,
+        ];
+        let d = DihedralHashes1024::from_u64_array(hash);
+
+        let d2 = DihedralHashes1024::from_u64_array(d.rotate90);
+        let d3 = DihedralHashes1024::from_u64_array(d2.rotate90);
+        let d4 = DihedralHashes1024::from_u64_array(d3.rotate90);
+
+        // d4.rotate90 = rotate90^4(hash) = hash
+        assert_eq!(d4.rotate90, d.original, "32×32 旋转 90° 四次应回到原始");
+    }
+
+    #[test]
+    fn test_all_zeros_32x32() {
+        let bits = vec![false; 1024];
+        let d = DihedralHashes1024::from_bits(&bits);
+        let all = d.all();
+        for v in &all {
+            assert_eq!(*v, [0u64; 16], "全零矩阵所有变换应为零");
+        }
+    }
+
+    #[test]
+    fn test_all_ones_32x32() {
+        let bits = vec![true; 1024];
+        let d = DihedralHashes1024::from_bits(&bits);
+        let all = d.all();
+        for v in &all {
+            assert_eq!(*v, [u64::MAX; 16], "全一矩阵所有变换应为 u64::MAX");
+        }
+    }
+
+    // ── 64×64 测试 ──────────────────────────────────────────────
+
+    /// 辅助：构造一个 64×64 位矩阵
+    fn sample_64x64_bits() -> Vec<bool> {
+        (0..4096).map(|i| i % 11 == 0).collect()
+    }
+
+    #[test]
+    fn test_pack_unpack_64x64_roundtrip() {
+        let bits = sample_64x64_bits();
+        let hash = pack_64x64(&bits);
+        let restored = unpack_u64_array_to_64x64(&hash);
+        assert_eq!(bits, restored);
+    }
+
+    #[test]
+    fn test_rotate90_four_times_equals_original_64x64() {
+        let bits = sample_64x64_bits();
+        let hash = pack_64x64(&bits);
+        let r1 = rotate_90_cw_64x64(&hash);
+        let r2 = rotate_90_cw_64x64(&r1);
+        let r3 = rotate_90_cw_64x64(&r2);
+        let r4 = rotate_90_cw_64x64(&r3);
+        assert_eq!(r4, hash, "64×64 旋转 90° 四次应等于原始");
+    }
+
+    #[test]
+    fn test_dihedral_hashes_4096_from_u64_array_roundtrip() {
+        let hash: [u64; 64] = {
+            let mut h = [0u64; 64];
+            for i in 0..64 {
+                h[i] = (i as u64).wrapping_mul(0x0123_4567_89AB_CDEF);
+            }
+            h
+        };
+        let d = DihedralHashes4096::from_u64_array(hash);
+        assert_eq!(d.original, hash);
+    }
+
+    #[test]
+    fn test_dihedral_hashes_4096_all_has_eight_variants() {
+        let hash: [u64; 64] = {
+            let mut h = [0u64; 64];
+            for i in 0..64 {
+                h[i] = i as u64 + 1;
+            }
+            h
+        };
+        let d = DihedralHashes4096::from_u64_array(hash);
+        let all = d.all();
+        assert_eq!(all.len(), 8);
+    }
+
+    #[test]
+    fn test_dihedral_hashes_4096_rotate90_four_times() {
+        let hash: [u64; 64] = {
+            let mut h = [0u64; 64];
+            for i in 0..64 {
+                h[i] = (i as u64).wrapping_mul(0xA1B2_C3D4_E5F6_0718);
+            }
+            h
+        };
+        let d = DihedralHashes4096::from_u64_array(hash);
+
+        let d2 = DihedralHashes4096::from_u64_array(d.rotate90);
+        let d3 = DihedralHashes4096::from_u64_array(d2.rotate90);
+        let d4 = DihedralHashes4096::from_u64_array(d3.rotate90);
+
+        assert_eq!(d4.rotate90, d.original, "64×64 旋转 90° 四次应回到原始");
+    }
+
+    #[test]
+    fn test_all_zeros_64x64() {
+        let bits = vec![false; 4096];
+        let d = DihedralHashes4096::from_bits(&bits);
+        let all = d.all();
+        for v in &all {
+            assert_eq!(*v, [0u64; 64], "全零矩阵所有变换应为零");
+        }
+    }
+
+    #[test]
+    fn test_all_ones_64x64() {
+        let bits = vec![true; 4096];
+        let d = DihedralHashes4096::from_bits(&bits);
+        let all = d.all();
+        for v in &all {
+            assert_eq!(*v, [u64::MAX; 64], "全一矩阵所有变换应为 u64::MAX");
+        }
     }
 }

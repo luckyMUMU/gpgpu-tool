@@ -2,7 +2,7 @@
 ///
 /// 与 WGSL 实现保持一致的 bit 映射策略（独立 bit_pos 计数器）。
 /// 与 GPU WGSL 算法完全对齐：f32 均值 + >= 比较（mean），直方图中值（median）。
-
+///
 /// Mean Hash（均值哈希）CPU 参考实现。
 /// 使用 f32 均值（与 GPU WGSL 一致），像素 >= 均值生成 1bit。
 pub fn mean_hash(pixels: &[u8], _width: u32, _height: u32) -> u64 {

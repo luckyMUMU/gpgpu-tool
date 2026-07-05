@@ -72,9 +72,9 @@ pub struct Sha256Computer {
 ///
 /// let mut ctx = GpuContext::new_sync().unwrap();
 /// let sha256 = Sha256Computer::new(&mut ctx).unwrap();
-/// let mut submitter = sha256.batch_submit(&ctx);
+/// let mut submitter = sha256.batch_submitter(&ctx).unwrap();
 /// // ... 添加任务
-/// let hashes = submitter.finish().unwrap();
+/// let hashes = submitter.wait_all().unwrap();
 /// ```
 pub struct Sha256BatchSubmitter<'a> {
     computer: &'a Sha256Computer,
@@ -239,8 +239,8 @@ impl Sha256Computer {
         let input_size = (all_words.len() * 4) as u64;
         let output_size = (count * HASH_U32_COUNT * 4) as u64;
 
-        let input_buffer_raw = ctx.buffer_pool().acquire(device, input_size, BufferUsage::Storage);
-        let output_buffer_raw = ctx.buffer_pool().acquire(device, output_size, BufferUsage::Storage);
+        let input_buffer_raw = ctx.buffer_pool().acquire(device, input_size, BufferUsage::Storage)?;
+        let output_buffer_raw = ctx.buffer_pool().acquire(device, output_size, BufferUsage::Storage)?;
 
         queue.write_buffer(&input_buffer_raw, 0, bytemuck::cast_slice(&all_words));
 
@@ -338,8 +338,8 @@ impl Sha256Computer {
         let input_size = (total_u32 * 4) as u64;
         let output_size = (count * HASH_U32_COUNT * 4) as u64;
 
-        let input_buffer_raw = ctx.buffer_pool().acquire(device, input_size, BufferUsage::Storage);
-        let output_buffer_raw = ctx.buffer_pool().acquire(device, output_size, BufferUsage::Storage);
+        let input_buffer_raw = ctx.buffer_pool().acquire(device, input_size, BufferUsage::Storage)?;
+        let output_buffer_raw = ctx.buffer_pool().acquire(device, output_size, BufferUsage::Storage)?;
 
         let mut input_words = Vec::with_capacity(total_u32);
         input_words.extend_from_slice(&block_counts);
@@ -418,6 +418,11 @@ impl<'a> Sha256BatchSubmitter<'a> {
     }
 
     /// 统一等待所有已提交批次完成，返回结果。
+    ///
+    /// 仅使用单次 `device.poll(Wait)` 同时等待 GPU 计算完成和 staging buffer 映射完成，
+    /// 而非先 poll 等待计算、再 poll 等待映射的两次同步。
+    /// `map_async()` 在 wgpu 中会自动等待 GPU 写入完成后才触发映射回调，
+    /// 因此第二个 poll 已覆盖第一个 poll 的等待语义。
     pub fn wait_all(&mut self) -> Result<Vec<(usize, [u8; 32])>, GpuError> {
         if self.pending_batches.is_empty() {
             return Ok(vec![]);
@@ -427,8 +432,6 @@ impl<'a> Sha256BatchSubmitter<'a> {
         if let Some(encoder) = self.encoder.take() {
             self.queue.submit(std::iter::once(encoder.finish()));
         }
-
-        self.device.poll(wgpu::Maintain::Wait);
 
         let mut results = Vec::with_capacity(
             self.pending_batches.iter().map(|b| b.message_count).sum(),
@@ -447,7 +450,9 @@ impl<'a> Sha256BatchSubmitter<'a> {
             map_receivers.push(recv_map);
         }
 
+        // 单次 poll 同时等待 GPU 计算完成 + staging buffer 映射完成
         self.device.poll(wgpu::Maintain::Wait);
+        crate::poll_counter::increment();
 
         // 验证所有 staging buffer 映射成功，同时记录映射状态以便错误路径清理
         let mut map_succeeded = Vec::with_capacity(map_receivers.len());
@@ -560,11 +565,11 @@ impl<'a> Sha256BatchSubmitter<'a> {
         let input_buffer_raw = self
             .ctx
             .buffer_pool()
-            .acquire(self.device, input_size, BufferUsage::Storage);
+            .acquire(self.device, input_size, BufferUsage::Storage)?;
         let output_buffer_raw = self
             .ctx
             .buffer_pool()
-            .acquire(self.device, output_size, BufferUsage::Storage);
+            .acquire(self.device, output_size, BufferUsage::Storage)?;
 
         self.queue
             .write_buffer(&input_buffer_raw, 0, bytemuck::cast_slice(&all_words));
@@ -638,8 +643,8 @@ impl<'a> Sha256BatchSubmitter<'a> {
         let input_size = (input_words.len() * 4) as u64;
         let output_size = (HASH_U32_COUNT * 4) as u64;
 
-        let input_buf_raw = self.ctx.buffer_pool().acquire(self.device, input_size, BufferUsage::Storage);
-        let output_buf_raw = self.ctx.buffer_pool().acquire(self.device, output_size, BufferUsage::Storage);
+        let input_buf_raw = self.ctx.buffer_pool().acquire(self.device, input_size, BufferUsage::Storage)?;
+        let output_buf_raw = self.ctx.buffer_pool().acquire(self.device, output_size, BufferUsage::Storage)?;
         self.queue.write_buffer(&input_buf_raw, 0, bytemuck::cast_slice(&input_words));
         let input_gpu = GpuBuffer::from_raw(input_buf_raw.clone(), input_size);
         let output_gpu = GpuBuffer::from_raw(output_buf_raw, output_size);

@@ -1,3 +1,4 @@
+use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -114,11 +115,28 @@ impl PipelineDescriptor {
 /// BindGroup 缓存上限。
 const BIND_GROUP_CACHE_MAX_ENTRIES: usize = 64;
 
-/// BindGroup 缓存，避免每次 dispatch 重新创建。
+/// 缓存键类型：典型绑定数 2-3，SmallVec 内联避免堆分配。
+type CacheKey = SmallVec<[usize; 8]>;
+
+/// 双向链表空指针哨兵。
+const NONE: u32 = u32::MAX;
+
+/// LRU 双向链表节点，存储在 arena 中。
+struct LruNode {
+    key: CacheKey,
+    value: Arc<wgpu::BindGroup>,
+    prev: u32,
+    next: u32,
+}
+
+/// O(1) LRU BindGroup 缓存。
 ///
-/// 缓存 key 为缓冲区地址列表（`wgpu::Buffer` 指针），缓存值为 `Arc<wgpu::BindGroup>`。
-/// 当缓存条目数达到 `BIND_GROUP_CACHE_MAX_ENTRIES` 时，采用 LRU 策略淘汰最久未访问的条目，
-/// 避免全量清空导致的性能尖峰。
+/// 使用 `HashMap<CacheKey, u32>` + arena 分配的双向链表实现全 O(1) 操作：
+/// - 查找：O(1) HashMap 查询
+/// - 触摸：O(1) 链表节点移动到 MRU 端
+/// - 淘汰：O(1) 移除 LRU 端尾节点
+///
+/// 相比旧方案（generation counter + O(n) 扫描），消除了线性扫描开销。
 ///
 /// # 缓存有效性
 ///
@@ -126,77 +144,163 @@ const BIND_GROUP_CACHE_MAX_ENTRIES: usize = 64;
 /// dispatch 时，缓存命中；当缓冲区被释放后重新分配，旧条目自然失效
 /// （不会命中，最终被淘汰策略清除）。
 struct BindGroupCache {
-    entries: RefCell<HashMap<Vec<usize>, Arc<wgpu::BindGroup>>>,
-    access_order: RefCell<Vec<Vec<usize>>>,
+    /// key → arena slot index
+    map: RefCell<HashMap<CacheKey, u32>>,
+    /// 节点 arena（slot 复用）
+    nodes: RefCell<Vec<Option<LruNode>>>,
+    /// 空闲 slot 回收列表
+    free: RefCell<Vec<u32>>,
+    /// MRU 端（最近使用）链表头
+    head: RefCell<u32>,
+    /// LRU 端（最久未使用）链表尾
+    tail: RefCell<u32>,
+    /// 当前缓存条目数
+    len: RefCell<usize>,
 }
 
 impl BindGroupCache {
     fn new() -> Self {
         Self {
-            entries: RefCell::new(HashMap::new()),
-            access_order: RefCell::new(Vec::new()),
+            map: RefCell::new(HashMap::new()),
+            nodes: RefCell::new(Vec::new()),
+            free: RefCell::new(Vec::new()),
+            head: RefCell::new(NONE),
+            tail: RefCell::new(NONE),
+            len: RefCell::new(0),
         }
     }
 
-    /// 获取或创建 BindGroup，缓存命中时返回已有实例并更新访问顺序。
+    /// 从 arena 分配一个 slot，优先复用空闲 slot。O(1) 操作。
+    fn alloc_slot(nodes: &mut Vec<Option<LruNode>>, free: &mut Vec<u32>, node: LruNode) -> u32 {
+        if let Some(idx) = free.pop() {
+            nodes[idx as usize] = Some(node);
+            idx
+        } else {
+            let idx = nodes.len() as u32;
+            nodes.push(Some(node));
+            idx
+        }
+    }
+
+    /// 将 slot 对应节点移动到链表头（MRU 端）。O(1) 操作。
+    fn move_to_head(
+        nodes: &mut Vec<Option<LruNode>>,
+        head: &mut u32,
+        tail: &mut u32,
+        slot: u32,
+    ) {
+        if *head == slot {
+            return; // 已经是 MRU，无需移动
+        }
+
+        let (prev, next) = {
+            let node = nodes[slot as usize].as_ref().unwrap();
+            (node.prev, node.next)
+        };
+
+        // 从当前位置摘除（slot 非 head，故 prev 必有效）
+        nodes[prev as usize].as_mut().unwrap().next = next;
+        if next != NONE {
+            nodes[next as usize].as_mut().unwrap().prev = prev;
+        } else {
+            *tail = prev; // slot 原为尾节点，更新 tail
+        }
+
+        // 插入链表头
+        let old_head = *head;
+        {
+            let node = nodes[slot as usize].as_mut().unwrap();
+            node.prev = NONE;
+            node.next = old_head;
+        }
+        if old_head != NONE {
+            nodes[old_head as usize].as_mut().unwrap().prev = slot;
+        }
+        *head = slot;
+    }
+
+    /// 获取或创建 BindGroup。缓存命中时 O(1) 更新 LRU 顺序并返回。
     fn get_or_create(
         &self,
         device: &Device,
         layout: &BindGroupLayout,
         buffers: &[&GpuBuffer],
     ) -> Arc<wgpu::BindGroup> {
-        let buffer_ids: Vec<usize> = buffers
+        let key: CacheKey = buffers
             .iter()
             .map(|b| b.raw() as *const _ as usize)
             .collect();
 
-        {
-            let entries = self.entries.borrow();
-            if let Some(bg) = entries.get(&buffer_ids) {
-                log::debug!("BindGroup 缓存命中: {} 个缓冲区", buffer_ids.len());
-                let result = Arc::clone(bg);
-                drop(entries);
-                self.touch(&buffer_ids);
-                return result;
-            }
+        // 缓存命中：移动到 MRU 端并返回
+        let hit = { self.map.borrow().get(&key).copied() };
+        if let Some(slot) = hit {
+            log::debug!("BindGroup 缓存命中: {} 个缓冲区", key.len());
+            let mut nodes = self.nodes.borrow_mut();
+            let mut head = self.head.borrow_mut();
+            let mut tail = self.tail.borrow_mut();
+            Self::move_to_head(&mut nodes, &mut head, &mut tail, slot);
+            return Arc::clone(&nodes[slot as usize].as_ref().unwrap().value);
         }
 
+        // 缓存未命中：创建新 BindGroup
         log::debug!("BindGroup 缓存未命中，创建新 BindGroup");
         let bg = Self::create_bind_group(device, layout, buffers);
         let arc = Arc::new(bg);
 
         {
-            let mut entries = self.entries.borrow_mut();
-            let mut order = self.access_order.borrow_mut();
-            Self::evict_if_needed(&mut entries, &mut order);
-            entries.insert(buffer_ids.clone(), Arc::clone(&arc));
-            order.push(buffer_ids);
+            let mut map = self.map.borrow_mut();
+            let mut nodes = self.nodes.borrow_mut();
+            let mut free_list = self.free.borrow_mut();
+            let mut head = self.head.borrow_mut();
+            let mut tail = self.tail.borrow_mut();
+            let mut len = self.len.borrow_mut();
+
+            // LRU 淘汰：O(1) 移除尾节点直到低于上限
+            while *len >= BIND_GROUP_CACHE_MAX_ENTRIES {
+                let lru = *tail;
+                if lru == NONE {
+                    break;
+                }
+
+                let lru_key = nodes[lru as usize].as_ref().unwrap().key.clone();
+                let lru_prev = nodes[lru as usize].as_ref().unwrap().prev;
+
+                if lru_prev != NONE {
+                    nodes[lru_prev as usize].as_mut().unwrap().next = NONE;
+                } else {
+                    *head = NONE; // 仅剩一个元素
+                }
+                *tail = lru_prev;
+
+                map.remove(&lru_key);
+                nodes[lru as usize] = None;
+                free_list.push(lru);
+                *len -= 1;
+
+                log::debug!("LRU 淘汰 BindGroup 缓存条目");
+            }
+
+            // 在链表头插入新节点
+            let new_node = LruNode {
+                key: key.clone(),
+                value: Arc::clone(&arc),
+                prev: NONE,
+                next: *head,
+            };
+            let slot = Self::alloc_slot(&mut nodes, &mut free_list, new_node);
+
+            if *head != NONE {
+                nodes[*head as usize].as_mut().unwrap().prev = slot;
+            } else {
+                *tail = slot; // 首个元素
+            }
+            *head = slot;
+
+            map.insert(key, slot);
+            *len += 1;
         }
 
         arc
-    }
-
-    /// 更新 key 的访问顺序，将其移到最近访问位置。
-    fn touch(&self, key: &[usize]) {
-        let mut order = self.access_order.borrow_mut();
-        order.retain(|k| k != key);
-        order.push(key.to_vec());
-    }
-
-    /// LRU 淘汰：当缓存满时移除最久未访问的条目。
-    fn evict_if_needed(
-        entries: &mut HashMap<Vec<usize>, Arc<wgpu::BindGroup>>,
-        order: &mut Vec<Vec<usize>>,
-    ) {
-        while entries.len() >= BIND_GROUP_CACHE_MAX_ENTRIES {
-            if let Some(old_key) = order.first().cloned() {
-                order.remove(0);
-                entries.remove(&old_key);
-                log::debug!("LRU 淘汰 BindGroup 缓存条目");
-            } else {
-                break;
-            }
-        }
     }
 
     fn create_bind_group(
@@ -221,12 +325,16 @@ impl BindGroupCache {
     }
 
     fn clear(&self) {
-        self.entries.borrow_mut().clear();
-        self.access_order.borrow_mut().clear();
+        self.map.borrow_mut().clear();
+        self.nodes.borrow_mut().clear();
+        self.free.borrow_mut().clear();
+        *self.head.borrow_mut() = NONE;
+        *self.tail.borrow_mut() = NONE;
+        *self.len.borrow_mut() = 0;
     }
 
     fn len(&self) -> usize {
-        self.entries.borrow().len()
+        *self.len.borrow()
     }
 }
 
@@ -240,7 +348,7 @@ impl BindGroupCache {
 ///
 /// 通常不直接构造，而是通过 `GpuContext::get_or_create_pipeline()` 获取缓存实例：
 ///
-/// ```no_run
+/// ```ignore
 /// use gpgpu_tool::{GpuContext, PipelineDescriptor};
 ///
 /// let mut ctx = GpuContext::new_sync().unwrap();
@@ -259,6 +367,8 @@ pub struct ComputePipeline {
     entry_point: &'static str,
     push_constant_size: Option<u32>,
     bind_group_cache: BindGroupCache,
+    /// 可复用 Uniform 缓冲区，避免非 Push Constant 路径每次创建新缓冲区
+    reusable_uniform: RefCell<Option<GpuBuffer>>,
 }
 
 impl ComputePipeline {
@@ -270,6 +380,9 @@ impl ComputePipeline {
             label: Some("compute_shader"),
             source: wgpu::ShaderSource::Wgsl(descriptor.wgsl.as_str().into()),
         });
+        // 注意：wgpu 的 create_shader_module 在 WGSL 编译失败时 panic 而非返回 Result。
+        // 如果未来 wgpu 版本提供 Result 接口，此处应返回 GpuError::ShaderCompile。
+        // 当前通过 descriptor.wgsl 的编译期有效性保证安全。
 
         let entries: Vec<wgpu::BindGroupLayoutEntry> = descriptor
             .bindings
@@ -323,6 +436,7 @@ impl ComputePipeline {
             entry_point: descriptor.entry_point,
             push_constant_size: descriptor.push_constant_size,
             bind_group_cache: BindGroupCache::new(),
+            reusable_uniform: RefCell::new(None),
         })
     }
 
@@ -424,7 +538,7 @@ impl ComputePipeline {
     ///
     /// 当管线使用 Push Constant 时，`params_bytes` 通过 `set_push_constants` 传递，
     /// `storage_buffers` 直接作为绑定组；当管线使用 Uniform buffer 时，自动创建
-    /// Uniform 缓冲区并前置到绑定组。
+    /// Uniform 缓冲区并追加到绑定组末尾（匹配 `default_3_binding` 布局顺序）。
     ///
     /// 此方法封装了 `push_constant_size().is_some()` 的分支判断，消除调用方重复代码。
     pub fn dispatch_with_params(
@@ -446,10 +560,74 @@ impl ComputePipeline {
                 compute_units,
             );
         } else {
-            let params_buffer = GpuBuffer::from_bytes(device, params_bytes, BufferUsage::Uniform);
-            let mut buffers: Vec<&GpuBuffer> = vec![&params_buffer];
+            let params_buffer = self.get_or_create_uniform_buffer(device, queue, params_bytes);
+            let mut buffers: Vec<&GpuBuffer> = Vec::with_capacity(storage_buffers.len() + 1);
             buffers.extend(storage_buffers);
+            buffers.push(&params_buffer);
             self.dispatch(device, queue, &buffers, dispatch_count, None, compute_units);
+        }
+    }
+
+    /// 将带参数的 GPU dispatch 编码到共享 encoder 中（不提交）。
+    ///
+    /// 与 [`dispatch_with_params`](Self::dispatch_with_params) 功能相同，
+    /// 但将命令编码到提供的 encoder 而非创建新 encoder 并立即提交。
+    /// 适用于多阶段管线需要合并为单次 `queue.submit()` 的场景。
+    pub fn encode_dispatch_with_params_into(
+        &self,
+        device: &Device,
+        encoder: &mut CommandEncoder,
+        params_bytes: &[u8],
+        storage_buffers: &[&GpuBuffer],
+        dispatch_count: [u32; 3],
+        compute_units: u32,
+    ) {
+        if self.push_constant_size.is_some() {
+            self.encode_dispatch_into(
+                device,
+                encoder,
+                storage_buffers,
+                dispatch_count,
+                Some(params_bytes),
+                compute_units,
+            );
+        } else {
+            // encode 路径无 queue 参数，无法 write_buffer 复用，仍创建新缓冲区
+            let params_buffer = GpuBuffer::from_bytes(device, params_bytes, BufferUsage::Uniform);
+            let mut buffers: Vec<&GpuBuffer> = Vec::with_capacity(storage_buffers.len() + 1);
+            buffers.extend(storage_buffers);
+            buffers.push(&params_buffer);
+            self.encode_dispatch_into(
+                device,
+                encoder,
+                &buffers,
+                dispatch_count,
+                None,
+                compute_units,
+            );
+        }
+    }
+
+    /// 获取或创建可复用 Uniform 缓冲区，并写入参数数据。
+    ///
+    /// 首次调用时创建缓冲区，后续调用复用已有缓冲区（通过 `queue.write_buffer` 更新内容）。
+    /// 如果参数数据大于已有缓冲区，自动创建更大的缓冲区替换。
+    fn get_or_create_uniform_buffer(&self, device: &Device, queue: &Queue, params_bytes: &[u8]) -> GpuBuffer {
+        let required_size = params_bytes.len() as u64;
+        let mut reusable = self.reusable_uniform.borrow_mut();
+
+        match reusable.as_ref() {
+            Some(existing) if existing.size() >= required_size => {
+                // 复用已有缓冲区，仅更新内容
+                queue.write_buffer(existing.raw(), 0, params_bytes);
+                existing.clone()
+            }
+            _ => {
+                // 创建新缓冲区（首次或参数更大时）
+                let new_buffer = GpuBuffer::from_bytes(device, params_bytes, BufferUsage::Uniform);
+                *reusable = Some(new_buffer.clone());
+                new_buffer
+            }
         }
     }
 

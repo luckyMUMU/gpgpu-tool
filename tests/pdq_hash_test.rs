@@ -176,7 +176,7 @@ fn test_pdq_cpu_gpu_consistency() {
         .collect();
 
     let cpu_result = cpu.compute(&pixels).unwrap();
-    let gpu_hashes = gpu.compute(&ctx, &[pixels.clone()], HashSize::new(16)).unwrap();
+    let gpu_hashes = gpu.compute(&ctx, std::slice::from_ref(&pixels), HashSize::new(16)).unwrap();
 
     let gpu_hash: [u64; 4] = [gpu_hashes[0], gpu_hashes[1], gpu_hashes[2], gpu_hashes[3]];
     assert_eq!(
@@ -210,7 +210,7 @@ fn test_pdq_gpu_invalid_hash_size() {
     };
 
     let pixels = vec![128u8; 64 * 64];
-    let result = gpu.compute(&ctx, &[pixels.clone()], HashSize::new(8));
+    let result = gpu.compute(&ctx, std::slice::from_ref(&pixels), HashSize::new(8));
     assert!(result.is_err(), "hash_size=8 应返回错误，PDQ 固定为 256-bit");
 
     let result = gpu.compute(&ctx, &[pixels], HashSize::new(32));

@@ -113,6 +113,43 @@ impl BkTree {
         tree
     }
 
+    /// 从已排序的哈希值批量构建平衡 BK-tree。
+    ///
+    /// 选择中间元素作为根，递归构建左右子树。
+    /// 相比逐个插入，构建的树更平衡，搜索性能更稳定。
+    /// 时间复杂度 O(N log N)（排序）+ O(N)（构建）。
+    pub fn from_hashes_sorted(mut hashes: Vec<u64>) -> Self {
+        if hashes.is_empty() {
+            return Self::new();
+        }
+        hashes.sort();
+        hashes.dedup();
+        let len = hashes.len();
+        let root = Self::build_balanced(&hashes, 0, len);
+        Self { root: Some(root), len }
+    }
+
+    fn build_balanced(hashes: &[u64], start: usize, end: usize) -> BkNode {
+        let mid = start + (end - start) / 2;
+        let hash = hashes[mid];
+        let mut children = Vec::new();
+
+        // 左半部分
+        if mid > start {
+            let left = Self::build_balanced(hashes, start, mid);
+            let d = hamming_distance(hash, left.hash);
+            children.push((d, Box::new(left)));
+        }
+        // 右半部分
+        if mid + 1 < end {
+            let right = Self::build_balanced(hashes, mid + 1, end);
+            let d = hamming_distance(hash, right.hash);
+            children.push((d, Box::new(right)));
+        }
+
+        BkNode { hash, children }
+    }
+
     /// 插入一个哈希值到树中。
     pub fn insert(&mut self, hash: u64) {
         self.len += 1;
@@ -247,5 +284,16 @@ mod tests {
 
         let results = tree.find(50, 64);
         assert_eq!(results.len(), 100);
+    }
+
+    #[test]
+    fn test_from_hashes_sorted() {
+        let hashes = vec![16u64, 1, 8, 2, 4];
+        let tree = BkTree::from_hashes_sorted(hashes);
+        assert_eq!(tree.len(), 5);
+
+        let results = tree.find(1, 1);
+        assert!(!results.is_empty());
+        assert!(results.contains(&(1, 0)));
     }
 }

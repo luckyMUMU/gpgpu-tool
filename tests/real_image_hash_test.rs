@@ -345,7 +345,7 @@ fn test_real_image_hash_similarity() {
         println!();
     }
 
-    for i in 0..hashes.len() {
-        assert_eq!(hamming_distance(hashes[i], hashes[i]), 0, "自身汉明距离应为 0");
+    for &hash in hashes.iter() {
+        assert_eq!(hamming_distance(hash, hash), 0, "自身汉明距离应为 0");
     }
 }

@@ -1,7 +1,97 @@
+use std::sync::Arc;
+
 use crate::batch::GpuBatchSubmitter;
 use crate::buffer::{BufferUsage, GpuBuffer};
 use crate::context::GpuContext;
 use crate::error::GpuError;
+use crate::pipeline::{BindingType, ComputePipeline, PipelineDescriptor};
+
+/// GPU 端 u8→u32 像素打包器。
+///
+/// 在 GPU 端完成灰度 u8 像素到 u32 的打包（每像素 1 个 u32），
+/// 替代 CPU 端 `pixel_pack::pack_u8_to_u32()`，减少 4× 上传数据量。
+///
+/// 持有 `pack_u8_to_u32` 着色器的管线，通过 `GpuContext` 管线缓存复用。
+pub(crate) struct GpuPixelPacker {
+    pipeline: Arc<ComputePipeline>,
+}
+
+const PACK_WGSL: &str = include_str!("pixel_pack.wgsl");
+
+impl GpuPixelPacker {
+    /// 创建 GPU 像素打包器。
+    pub(crate) fn new(ctx: &mut GpuContext) -> Result<Self, GpuError> {
+        let descriptor = PipelineDescriptor {
+            bindings: vec![
+                BindingType::StorageReadOnly,
+                BindingType::StorageReadWrite,
+                BindingType::Uniform,
+            ],
+            wgsl: PACK_WGSL.to_string(),
+            workgroup_size: [256, 1, 1],
+            entry_point: "pack_u8_to_u32",
+            push_constant_size: None,
+        };
+        let pipeline = ctx.get_or_create_pipeline(&descriptor)?;
+        Ok(Self { pipeline })
+    }
+
+    /// 将原始 u8 灰度数据上传到 GPU 并打包为 u32 格式。
+    ///
+    /// 上传数据量 = `pixel_count` 字节（向上对齐到 4 字节），
+    /// 远少于 CPU 打包模式的 `pixel_count * 4` 字节。
+    /// GPU 端 dispatch 打包着色器，生成 u32 格式 GpuBuffer。
+    pub(crate) fn pack_raw(
+        &self,
+        ctx: &GpuContext,
+        raw_u8: &[u8],
+        pixel_count: usize,
+    ) -> Result<GpuBuffer, GpuError> {
+        let device = ctx.device()?;
+        let queue = ctx.queue()?;
+
+        // 输入 buffer：原始 u8 数据，向上对齐到 4 字节（u32 对齐）
+        let aligned_input_size = ((pixel_count + 3) & !3) as u64;
+        let input_buffer_raw = ctx
+            .buffer_pool()
+            .acquire(device, aligned_input_size, BufferUsage::Storage)?;
+        // 写入原始 u8 数据（不足 4 字节的部分由 buffer 初始化为 0）
+        queue.write_buffer(&input_buffer_raw, 0, raw_u8);
+        let input_gpu = GpuBuffer::from_raw(input_buffer_raw, aligned_input_size);
+
+        // 输出 buffer：u32 格式，每像素 1 个 u32
+        let output_size = (pixel_count * 4) as u64;
+        let output_buffer_raw = ctx
+            .buffer_pool()
+            .acquire(device, output_size, BufferUsage::Storage)?;
+        let output_gpu = GpuBuffer::from_raw(output_buffer_raw, output_size);
+
+        // 参数：pixel_count
+        let params: [u32; 4] = [pixel_count as u32, 0, 0, 0];
+        let params_bytes = bytemuck::cast_slice::<u32, u8>(&params);
+
+        // dispatch: 每线程处理 4 个像素，workgroup_size = 256
+        let threads_needed = ((pixel_count as u32) + 3) / 4;
+        let dispatch_x = (threads_needed + 255) / 256;
+
+        self.pipeline.dispatch_with_params(
+            device,
+            queue,
+            params_bytes,
+            &[&input_gpu, &output_gpu],
+            [dispatch_x.max(1), 1, 1],
+            ctx.compute_units(),
+        );
+
+        // 注意：不释放输入 buffer 到 buffer_pool。
+        // queue.submit() 是非阻塞的，GPU 可能仍在读取输入 buffer。
+        // 如果释放到 pool，下一次 acquire 可能返回同一 buffer 并通过 write_buffer 覆盖数据。
+        // wgpu 的 Buffer 在所有引用它的已提交命令完成后自动销毁，因此直接 drop 即可。
+        drop(input_gpu);
+
+        Ok(output_gpu)
+    }
+}
 
 /// CPU 线程预打包的分块数据。
 ///

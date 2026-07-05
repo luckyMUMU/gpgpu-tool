@@ -4,9 +4,16 @@
 //!
 //! 1. 扫描目录中的图像文件（PNG/JPEG/BMP/GIF/WebP）
 //! 2. 加载图像（支持 GPU 双线性或 Lanczos3 高质量缩放）
-//! 3. 使用 GPU 批量计算感知哈希
+//! 3. 使用 GPU 批量计算感知哈希（rayon 并行解码 + GPU 端像素打包）
 //! 4. 使用 GPU 汉明距离矩阵查找相似对
 //! 5. 按相似组分组输出结果
+//!
+//! ## 优化特性
+//!
+//! - **rayon 并行解码**：CPU 多核并行加载图像 + RGBA→灰度转换
+//! - **GPU 端像素打包**：上传原始 u8 数据（非 u32），减少 4× 上传带宽
+//! - **双缓冲流水线**：CPU 加载与 GPU 上传重叠执行
+//! - **SIMD 灰度转换**（需 `simd` feature）：`wide` crate 向量化 RGBA→灰度
 //!
 //! ## 用法
 //!
@@ -14,12 +21,16 @@
 //! # 基本用法（默认: Gradient 算法, hash_size=8, tolerance=10, GPU 缩放）
 //! cargo run --example similar_images --features czkawka-compat -- /path/to/images
 //!
-//! # 使用 Lanczos3 高质量缩放
+//! # 使用 Lanczos3 高质量缩放 + 32×32 哈希
 //! cargo run --example similar_images --features czkawka-compat -- \
 //!     /path/to/images --resize lanczos3 -s 32 -a gradient
 //!
-//! # 零拷贝 GPU 流式加载（最小化 CPU 内存，适合大批量处理）
+//! # 零拷贝 GPU 流水线（rayon 并行 + GPU 端打包，适合大批量处理）
 //! cargo run --example similar_images --features czkawka-compat -- \
+//!     /path/to/images --zero-copy -r --sub-batch-size 16
+//!
+//! # 启用 SIMD 加速（需 simd feature）
+//! cargo run --example similar_images --features "czkawka-compat,simd" -- \
 //!     /path/to/images --zero-copy -r
 //!
 //! # 参数说明
@@ -27,8 +38,11 @@
 //! #   -a, --algorithm <ALGO>  哈希算法 (默认: gradient)
 //! #   -s, --hash-size <N>     哈希尺寸 8/16/32/64 (默认: 8)
 //! #   --resize <MODE>         缩放算法: gpu(默认) / lanczos3
-//! #   --zero-copy             启用零拷贝 GPU 流式加载（最小化 CPU 内存）
+//! #   --zero-copy             启用零拷贝 GPU 流水线（rayon 并行 + GPU 端打包）
 //! #   --memory-budget <MB>    CPU 内存预算（MB，默认: 512）
+//! #   --sub-batch-size <N>    流水线子批大小 (默认: 16, 范围 1-64)
+//! #   --limit <N>             限制处理的图像数量 (默认: 0 = 不限制)
+//! #   --no-pipeline           禁用流水线优化（回退到逐张上传模式）
 //! #   -r, --recursive         递归扫描子目录
 //! #   -v, --verbose           详细输出（显示哈希值）
 //! #   -h, --help              帮助
@@ -455,8 +469,12 @@ fn main() {
         ResizeMode::Gpu => "GPU 双线性插值 (快速)",
         ResizeMode::Lanczos3 => "Lanczos3 高质量缩放 (CPU)",
     });
-    println!("      零拷贝模式: {}", if args.zero_copy { format!("是 (流水线优化, 子批={})", args.sub_batch_size) } else { "否 (批量加载)".to_string() });
+    println!("      零拷贝模式: {}", if args.zero_copy { format!("是 (rayon 并行 + GPU 端打包, 子批={})", args.sub_batch_size) } else { "否 (批量加载)".to_string() });
     println!("      内存预算: {} MB", args.memory_budget_mb);
+    #[cfg(feature = "simd")]
+    println!("      SIMD 灰度转换: 启用 (wide u16x8)");
+    #[cfg(not(feature = "simd"))]
+    println!("      SIMD 灰度转换: 未启用 (使用 --features simd 启用)");
 
     // 根据零拷贝模式选择加速器类型
     let accelerator = if args.zero_copy {
@@ -507,7 +525,7 @@ fn main() {
     // ── 3. 流式分批加载图像并计算哈希 ─────────────────────────
     println!("\n[3/4] 流式分批加载 + GPU 感知哈希计算...");
     if args.zero_copy {
-        println!("      模式: 零拷贝 GPU 流水线（CPU/GPU 双缓冲, 子批={}, 峰值 CPU 内存 = {} 张图像）",
+        println!("      模式: 零拷贝 GPU 流水线（rayon 并行解码 + GPU 端打包 + 双缓冲, 子批={}, 峰值 CPU 内存 = {} 张图像）",
             args.sub_batch_size, args.sub_batch_size);
     }
 

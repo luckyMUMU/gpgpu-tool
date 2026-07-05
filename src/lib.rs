@@ -354,6 +354,12 @@ pub use pipeline_builder::GpuPipelineBuilder;
 /// 参见 [`pipeline_builder::GpuPipelineStep`]。
 pub use pipeline_builder::GpuPipelineStep;
 
+/// GPU 缩放滤波器类型（Box / Lanczos3）。
+pub use tasks::gpu_resize::ResizeFilter;
+
+/// GPU 图像缩放器配置参数。
+pub use tasks::gpu_resize::GpuResizeConfig;
+
 /// GPU PDQ 感知哈希（需 `pdq` feature）。
 #[cfg(feature = "pdq")]
 pub use tasks::pdq_hash::PdqHashGpu;

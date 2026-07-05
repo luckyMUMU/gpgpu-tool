@@ -20,6 +20,7 @@ image = { version = "0.25", optional = true }
 
 sha2 = { version = "0.10", optional = true }
 rayon = { version = "1.10", optional = true }
+wide = { version = "0.7", optional = true }
 
 [features]
 default = []
@@ -28,13 +29,14 @@ parallel-cpu = ["cpu-fallback", "dep:rayon"]
 dual-encoder = []
 pdq = []
 image = ["dep:image"]
+simd = ["dep:wide"]
 
 # GPU 加速集成入口 feature，聚合图像处理依赖。
 # wgpu 为核心依赖（始终包含），此 feature 额外启用 image crate 集成。
 gpu-accel = ["image"]
 
-# czkawka 兼容层入口，依赖 gpu-accel。
-czkawka-compat = ["gpu-accel"]
+# czkawka 兼容层入口，依赖 gpu-accel 和 parallel-cpu（rayon 并行解码）。
+czkawka-compat = ["gpu-accel", "parallel-cpu"]
 
 [dev-dependencies]
 rand = "0.9"
